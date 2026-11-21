@@ -559,32 +559,30 @@ fn scan_rows<const N: usize>(chunk: S, _sc: &mut Scan, mut on_row: impl FnMut(&[
     let len = chunk.len();
     assert!(len < u32::MAX as usize - 128);
     let base = chunk.as_ptr();
+    // Branch-free quote rule (R-C5..R-C7): a field of 2+ bytes that starts and ends with a
+    // quote is wrapped and stripped; the line is well formed exactly when its quote count is
+    // twice the number of wrapped fields.
     let mut emit = |line_start: usize, commas: &[u32; N], end: usize, nq: u32| {
         let mut fields: [S; N] = [&[]; N];
         let mut s = line_start;
+        let mut wrapped = 0u32;
         for k in 0..N {
             let e = if k + 1 < N { commas[k] as usize } else { end };
-            fields[k] = unsafe { core::slice::from_raw_parts(base.add(s), e - s) };
+            let len = e - s;
+            let long = len >= 2;
+            let (a, b) = unsafe {
+                let ps = base.add(if len > 0 { s } else { line_start });
+                let pe = base.add(if long { e - 1 } else if len > 0 { s } else { line_start });
+                (*ps, *pe)
+            };
+            let q = (long & (a == b'"') & (b == b'"')) as usize;
+            wrapped += q as u32;
+            fields[k] = unsafe { core::slice::from_raw_parts(base.add(s + q), len - 2 * q) };
             s = e + 1;
         }
-        if nq != 0 {
-            // Every quote must be the first or last byte of a field that has both.
-            let mut wrapped = 0u32;
-            for f in fields.iter_mut() {
-                if !f.is_empty() && f[0] == b'"' {
-                    let l = f.len();
-                    if l < 2 || f[l - 1] != b'"' {
-                        return; // R-C7
-                    }
-                    *f = &f[1..l - 1];
-                    wrapped += 2;
-                }
-            }
-            if wrapped != nq {
-                return; // R-C7
-            }
+        if 2 * wrapped == nq {
+            on_row(&fields);
         }
-        on_row(&fields);
     };
     let mut commas = [0u32; N]; // commas of the current line; the last slot is never used
     let mut nc = 0usize; // commas of the current line so far; N means "too many"
