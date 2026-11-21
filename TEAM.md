@@ -1,5 +1,5 @@
 # Team
 
-Name:
+Name: Conquer The World
 Members: Mahmood Idelbi
 Engine: DuckDB

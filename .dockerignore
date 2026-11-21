@@ -6,6 +6,7 @@ out/
 
 # Generated data and local environment
 big/
+big*/
 dev-answer/
 *.parquet
 *.csv.gz

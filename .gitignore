@@ -2,6 +2,7 @@
 dev/
 out/
 big/
+big*/
 dev-answer/
 *.parquet
 *.csv.gz
