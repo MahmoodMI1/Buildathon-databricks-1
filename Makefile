@@ -30,3 +30,11 @@ run-dev: build
 ANSWER ?= dev-answer
 check-dev:
 	python3 scripts/compare.py out $(ANSWER)
+
+## Track B: compile the Rust binary in a container (no local Rust needed), incremental
+bin:
+	docker run --rm -v "$(CURDIR)":/work -v shopping-cargo-registry:/usr/local/cargo/registry -w /work rust:1.85 cargo build --release
+
+## Track B: run all fixtures against the binary from `make bin`, without rebuilding the image
+fixtures-bin: bin
+	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/run_bin.sh
