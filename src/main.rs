@@ -480,6 +480,22 @@ fn manifest_value(text: &str, key: &str) -> i64 {
 mod simd {
     use core::arch::x86_64::*;
     /// (bit i set when byte i is `,` or `\n`, bit i set when byte i is `"`) for 64 bytes at `p`.
+    #[cfg(target_feature = "avx2")]
+    #[inline(always)]
+    pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
+        let (comma, nl, quote) =
+            (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let st_a = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, nl));
+        let st_b = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), _mm256_cmpeq_epi8(b, nl));
+        let st = (_mm256_movemask_epi8(st_a) as u32 as u64) | ((_mm256_movemask_epi8(st_b) as u32 as u64) << 32);
+        let qu = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)) as u32 as u64) << 32);
+        (st, qu)
+    }
+    /// SSE2 version, for builds without AVX2.
+    #[cfg(not(target_feature = "avx2"))]
     #[inline(always)]
     pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
         let (comma, nl, quote) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
@@ -841,9 +857,10 @@ impl LinkTable {
 // ---------------------------------------------------------------------------
 // Rows. A person is identified by (pkey, h2):
 //   linked ID   -> pkey = 1 << 63 | id of the naming ID, h2 = 0
-//   other user  -> (pkey, h2) = fingerprint(user), pkey with bit 63 cleared
-// k2 = h2 << 32 | ts_rel, so sorting by (pkey, k2) groups a person and orders by time.
+//   other user  -> (pkey, h2) = fingerprint(user), pkey with bit 63 cleared, top 23 bits of h2
 // Timestamps are relative to `base` = window_start - 7 days (the earliest valid click).
+// Byte strings (user ID, click ID) are kept as 40-bit offsets from the lowest mapped
+// input address; their end is the next `,` or `"`.
 // ---------------------------------------------------------------------------
 
 const LINKED: u64 = 1 << 63;
@@ -861,97 +878,192 @@ fn bucket_of(stored_pkey: u64) -> usize {
     (stored_pkey >> (64 - BUCKET_BITS)) as usize
 }
 
-/// A valid event, written once while parsing into its person's partition. 32 bytes.
+const TS_MASK: u64 = 0xFFFF_FFFF;
+
+/// A valid event or click, written once while parsing into its person's partition. 24 bytes.
+///   w0 = person key, rotated
+///   w1 = h2 (23 bits) << 41 | ts_rel (32 bits) << 9 | low 9 bits
+///        events: category (8 bits) << 1 | is_purchase;  clicks: 0
+///   w2 = events: user ID offset (40 bits) << 24 | price (24 bits)
+///        clicks: click_id offset (40 bits) << 16 | campaign (16 bits)
+/// Sorting by (w0, w1) groups a person and orders its rows by time.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Row {
-    pkey: u64,
-    k2: u64,
-    name: u64, // packed user ID bytes (unused for linked persons)
-    price: u32,
-    cat: u16,
-    typ: u8,
-    dead: u8, // set by dedup when another copy of the event wins (R-E2)
+    w0: u64,
+    w1: u64,
+    w2: u64,
 }
 
-/// A valid click. 32 bytes.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct CRow {
-    pkey: u64,
-    k2: u64,
-    cid: u64, // packed click_id bytes, for the R-K4 tie-break
-    camp: u16,
-    dead: u8, // set by dedup for every copy after the first (R-K2)
-}
-
-/// Dedup key of one well-formed event line (R-E1, R-E2). 24 bytes.
-/// (h1, h2) is the 96-bit fingerprint of event_id.
-#[derive(Clone, Copy)]
-struct EKey {
-    h1: u64,
-    row: usize, // address of its Row, 0 when this copy is invalid (R-E3, R-E4)
-    h2: u32,
-    ingest: i32, // seconds relative to window_start; i32::MAX when unparseable
-}
-
-/// Dedup key of one valid click line (R-K2).
-#[derive(Clone, Copy)]
-struct CKey {
-    h1: u64,
-    row: usize,
-    h2: u32,
-}
-
-/// Append-only buffer made of fixed-size blocks: element addresses stay valid, and
-/// nothing is reserved beyond the current block.
-struct BlockBuf<T> {
-    blocks: Vec<Vec<T>>,
-}
-
-impl<T> BlockBuf<T> {
-    const BLOCK: usize = 512;
-    fn new() -> Self {
-        BlockBuf { blocks: Vec::new() }
+impl Row {
+    #[inline(always)]
+    fn person(&self) -> (u64, u64) {
+        (self.w0, self.w1 >> 41)
     }
-    #[cfg_attr(feature = "prof", inline(never))]
-    #[cfg_attr(not(feature = "prof"), inline(always))]
-    fn push(&mut self, v: T) -> *mut T {
-        if self.blocks.last().map_or(true, |b| b.len() == b.capacity()) {
-            self.blocks.push(Vec::with_capacity(Self::BLOCK));
+    #[inline(always)]
+    fn ts(&self) -> i64 {
+        ((self.w1 >> 9) & TS_MASK) as i64
+    }
+}
+
+/// Dedup key of one line. 16 bytes.
+///   events (R-E1, R-E2): w = h2 (10 bits) << 54 | ingest (22 bits) << 32 | row id
+///   clicks (R-K2):       w = h2 (32 bits) << 32 | row id
+/// (h1, h2) is the fingerprint of event_id / click_id. The row id locates the line's Row
+/// (thread 4 bits, block 19 bits, slot 8 bits); NO_ROW when this copy is invalid.
+#[derive(Clone, Copy)]
+struct Key {
+    h1: u64,
+    w: u64,
+}
+
+const NO_ROW: u32 = u32::MAX;
+const INGEST_BITS: u64 = 0x3F_FFFF;
+const BLK: usize = 256;
+
+/// A fixed-size block of rows or keys. `dead` has one bit per slot, set by dedup when
+/// another copy of the line wins.
+#[repr(C)]
+struct Block<T> {
+    dead: [std::sync::atomic::AtomicU64; 4],
+    len: u32,
+    items: [std::mem::MaybeUninit<T>; BLK],
+}
+
+impl<T> Block<T> {
+    #[inline(always)]
+    fn items(&self) -> &[T] {
+        unsafe { core::slice::from_raw_parts(self.items.as_ptr() as *const T, self.len as usize) }
+    }
+    #[inline(always)]
+    fn is_dead(&self, slot: usize) -> bool {
+        self.dead[slot >> 6].load(std::sync::atomic::Ordering::Relaxed) >> (slot & 63) & 1 != 0
+    }
+}
+
+/// Bump allocator over 2 MiB slabs that ask for transparent huge pages: one page fault
+/// per slab instead of one per 4 KiB.
+struct Slabs {
+    cur: usize,
+    end: usize,
+}
+
+const SLAB: usize = 2 << 20;
+
+impl Slabs {
+    fn alloc<T>(&mut self) -> *mut Block<T> {
+        let size = (std::mem::size_of::<Block<T>>() + 63) & !63;
+        if self.cur + size > self.end {
+            let layout = std::alloc::Layout::from_size_align(SLAB, SLAB).unwrap();
+            let p = unsafe { std::alloc::alloc(layout) };
+            assert!(!p.is_null(), "out of memory");
+            unsafe { libc::madvise(p as *mut libc::c_void, SLAB, libc::MADV_HUGEPAGE) };
+            self.cur = p as usize;
+            self.end = self.cur + SLAB;
         }
-        let b = self.blocks.last_mut().unwrap();
-        let n = b.len();
+        let b = self.cur as *mut Block<T>;
+        self.cur += size;
         unsafe {
-            let p = b.as_mut_ptr().add(n);
-            p.write(v);
-            b.set_len(n + 1);
-            p
+            core::ptr::addr_of_mut!((*b).dead).write(Default::default());
+            core::ptr::addr_of_mut!((*b).len).write(0);
+        }
+        b
+    }
+}
+
+/// The blocks of one shard, in the order they were filled.
+struct Bucket<T> {
+    blocks: Vec<*mut Block<T>>,
+    cur: *mut Block<T>,
+    cur_no: u32, // number of `cur` in the thread's block table (rows only)
+}
+
+impl<T> Bucket<T> {
+    fn new() -> Self {
+        Bucket { blocks: Vec::new(), cur: core::ptr::null_mut(), cur_no: 0 }
+    }
+    /// Appends a value; `table` numbers the thread's blocks so that a row id can find them.
+    /// Returns (block number, slot).
+    #[inline(always)]
+    fn push(&mut self, v: T, slabs: &mut Slabs, table: &mut Vec<*mut Block<T>>) -> (u32, u32) {
+        unsafe {
+            if self.cur.is_null() || (*self.cur).len as usize == BLK {
+                self.cur = slabs.alloc::<T>();
+                self.cur_no = table.len() as u32;
+                table.push(self.cur);
+                self.blocks.push(self.cur);
+            }
+            let b = &mut *self.cur;
+            let slot = b.len;
+            b.items.as_mut_ptr().add(slot as usize).write(std::mem::MaybeUninit::new(v));
+            b.len = slot + 1;
+            (self.cur_no, slot)
         }
     }
     fn len(&self) -> usize {
-        self.blocks.iter().map(|b| b.len()).sum()
+        self.blocks.iter().map(|&b| unsafe { (*b).len as usize }).sum()
     }
 }
 
 /// Everything one parser thread produces, bucketed by shard.
 struct ThreadOut {
     scan: Scan,
-    ev_keys: Vec<BlockBuf<EKey>>, // by event_id shard
-    ev_rows: Vec<BlockBuf<Row>>,  // by person shard
-    cl_keys: Vec<BlockBuf<CKey>>, // by click_id shard
-    cl_rows: Vec<BlockBuf<CRow>>, // by person shard
+    slabs: Slabs,
+    ev_keys: Vec<Bucket<Key>>, // by event_id shard
+    ev_rows: Vec<Bucket<Row>>, // by person shard
+    cl_keys: Vec<Bucket<Key>>, // by click_id shard
+    cl_rows: Vec<Bucket<Row>>, // by person shard
+    ev_blocks: Vec<*mut Block<Row>>, // every event row block of this thread, by number
+    cl_blocks: Vec<*mut Block<Row>>,
+    key_blocks: Vec<*mut Block<Key>>, // unused numbering for key blocks
 }
+
+// Safety: the raw pointers are to blocks owned by this ThreadOut for the whole run; after
+// parsing they are only read, apart from the atomic dead bits.
+unsafe impl Send for ThreadOut {}
+unsafe impl Sync for ThreadOut {}
 
 impl ThreadOut {
     fn new() -> Self {
         ThreadOut {
             scan: Scan::default(),
-            ev_keys: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
-            ev_rows: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
-            cl_keys: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
-            cl_rows: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
+            slabs: Slabs { cur: 0, end: 0 },
+            ev_keys: (0..NSHARD).map(|_| Bucket::new()).collect(),
+            ev_rows: (0..NSHARD).map(|_| Bucket::new()).collect(),
+            cl_keys: (0..NSHARD).map(|_| Bucket::new()).collect(),
+            cl_rows: (0..NSHARD).map(|_| Bucket::new()).collect(),
+            ev_blocks: Vec::new(),
+            cl_blocks: Vec::new(),
+            key_blocks: Vec::new(),
         }
+    }
+}
+
+#[inline(always)]
+fn row_id(thread: usize, block: u32, slot: u32) -> u32 {
+    debug_assert!(thread < 16 && block < (1 << 19) && slot < 256);
+    ((thread as u32) << 27) | (block << 8) | slot
+}
+
+/// Marks the row behind a row id dead.
+#[inline(always)]
+fn kill(tables: &[&Vec<*mut Block<Row>>], id: u32) {
+    let (t, b, slot) = ((id >> 27) as usize, ((id >> 8) & 0x7_FFFF) as usize, (id & 0xFF) as usize);
+    unsafe {
+        (*tables[t][b]).dead[slot >> 6].fetch_or(1 << (slot & 63), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The bytes of an ID stored as an offset: from the offset up to the next `,` or `"`.
+#[inline(always)]
+fn id_at(map_base: usize, off: u64) -> S {
+    unsafe {
+        let p = (map_base + off as usize) as *const u8;
+        let mut n = 0usize;
+        while *p.add(n) != b',' && *p.add(n) != b'"' {
+            n += 1;
+        }
+        core::slice::from_raw_parts(p, n)
     }
 }
 
@@ -1209,7 +1321,7 @@ struct Acc {
     active: Vec<u16>,
     cat_sum: Vec<i64>,
     events: Vec<Row>,
-    clicks: Vec<CRow>,
+    clicks: Vec<Row>,
     ev_start: Vec<u32>, // bucket b of `events` is ev_start[b]..ev_start[b + 1]
     cl_start: Vec<u32>,
     n_sessions: u64,
@@ -1222,6 +1334,7 @@ struct Dims<'a> {
     organic: usize,
     cat_names: &'a [S],
     names: &'a [Vec<S>], // linked IDs: names[shard][index within shard]
+    map_base: usize,     // base address of the 40-bit ID offsets
 }
 
 impl Acc {
@@ -1253,55 +1366,43 @@ impl Acc {
     /// with a counting pass (no comparison sort over the whole partition).
     #[cfg_attr(feature = "prof", inline(never))]
     fn load(&mut self, outs: &[ThreadOut], p: usize) {
-        fn scatter<T: Copy + 'static>(
-            blocks: impl Fn() -> Vec<&'static [T]>,
-            live_bucket: impl Fn(&T) -> Option<usize>,
-            dst: &mut Vec<T>,
-            start: &mut [u32],
-        ) {
-            let parts = blocks();
+        fn scatter(blocks: &[*mut Block<Row>], dst: &mut Vec<Row>, start: &mut [u32]) {
             let mut count = [0u32; NBUCKET];
-            for part in &parts {
-                for r in part.iter() {
-                    if let Some(b) = live_bucket(r) {
-                        count[b] += 1;
+            for &b in blocks {
+                let b = unsafe { &*b };
+                for (i, r) in b.items().iter().enumerate() {
+                    if !b.is_dead(i) {
+                        count[bucket_of(r.w0)] += 1;
                     }
                 }
             }
             let mut next = [0u32; NBUCKET];
             let mut total = 0u32;
-            for b in 0..NBUCKET {
-                start[b] = total;
-                next[b] = total;
-                total += count[b];
+            for k in 0..NBUCKET {
+                start[k] = total;
+                next[k] = total;
+                total += count[k];
             }
             start[NBUCKET] = total;
             dst.clear();
             dst.reserve(total as usize);
             let out = dst.as_mut_ptr();
-            for part in &parts {
-                for r in part.iter() {
-                    if let Some(b) = live_bucket(r) {
-                        unsafe { out.add(next[b] as usize).write(*r) };
-                        next[b] += 1;
+            for &b in blocks {
+                let b = unsafe { &*b };
+                for (i, r) in b.items().iter().enumerate() {
+                    if !b.is_dead(i) {
+                        let k = bucket_of(r.w0);
+                        unsafe { out.add(next[k] as usize).write(*r) };
+                        next[k] += 1;
                     }
                 }
             }
             unsafe { dst.set_len(total as usize) };
         }
-        // Safety of the 'static slices: `outs` outlives every Acc and is not modified any more.
-        scatter(
-            || outs.iter().flat_map(|o| o.ev_rows[p].blocks.iter()).map(|b| unsafe { &*(b.as_slice() as *const [Row]) }).collect(),
-            |r: &Row| if r.dead == 0 { Some(bucket_of(r.pkey)) } else { None },
-            &mut self.events,
-            &mut self.ev_start,
-        );
-        scatter(
-            || outs.iter().flat_map(|o| o.cl_rows[p].blocks.iter()).map(|b| unsafe { &*(b.as_slice() as *const [CRow]) }).collect(),
-            |r: &CRow| if r.dead == 0 { Some(bucket_of(r.pkey)) } else { None },
-            &mut self.clicks,
-            &mut self.cl_start,
-        );
+        let ev: Vec<*mut Block<Row>> = outs.iter().flat_map(|o| o.ev_rows[p].blocks.iter().copied()).collect();
+        scatter(&ev, &mut self.events, &mut self.ev_start);
+        let cl: Vec<*mut Block<Row>> = outs.iter().flat_map(|o| o.cl_rows[p].blocks.iter().copied()).collect();
+        scatter(&cl, &mut self.clicks, &mut self.cl_start);
     }
 
     /// R-O2: close one (person, day) row. top_category = highest summed purchase price,
@@ -1341,30 +1442,31 @@ impl Acc {
         // bucket completes the order by (pkey, k2).
         // Ties in ts need no order: one pass decides the sessions, so tied events cannot split.
         for b in 0..NBUCKET {
-            events[self.ev_start[b] as usize..self.ev_start[b + 1] as usize].sort_unstable_by_key(|e| (e.pkey, e.k2));
+            events[self.ev_start[b] as usize..self.ev_start[b + 1] as usize].sort_unstable_by_key(|e| (e.w0, e.w1));
             // Within a ts, click_id DESCENDING: the last click at or before a session start is
             // then the latest one with the smallest click_id (R-K4).
             clicks[self.cl_start[b] as usize..self.cl_start[b + 1] as usize].sort_unstable_by(|a, b| {
-                (a.pkey, a.k2).cmp(&(b.pkey, b.k2)).then_with(|| unpack_ref(b.cid).cmp(unpack_ref(a.cid)))
+                (a.w0, a.w1)
+                    .cmp(&(b.w0, b.w1))
+                    .then_with(|| id_at(d.map_base, b.w2 >> 16).cmp(id_at(d.map_base, a.w2 >> 16)))
             });
         }
 
-        const TS: u64 = 0xFFFF_FFFF;
         let ndays = d.ndays;
         let n = events.len();
         let (mut i, mut ci) = (0usize, 0usize);
         while i < n {
-            // One person = one (pkey, h2); h2 is the high half of k2.
-            let pid = (events[i].pkey, events[i].k2 >> 32);
+            // One person = one (pkey, h2).
+            let pid = events[i].person();
             let mut j = i;
-            while j < n && (events[j].pkey, events[j].k2 >> 32) == pid {
+            while j < n && events[j].person() == pid {
                 j += 1;
             }
-            while ci < clicks.len() && (clicks[ci].pkey, clicks[ci].k2 >> 32) < pid {
+            while ci < clicks.len() && clicks[ci].person() < pid {
                 ci += 1;
             }
             let cs = ci;
-            while ci < clicks.len() && (clicks[ci].pkey, clicks[ci].k2 >> 32) == pid {
+            while ci < clicks.len() && clicks[ci].person() == pid {
                 ci += 1;
             }
             let ev = &events[i..j];
@@ -1375,7 +1477,7 @@ impl Acc {
                 let id = person as u32;
                 d.names[(id & 0xFF) as usize][(id >> 8) as usize] // R-L3
             } else {
-                unpack_ref(ev[0].name) // R-L4
+                id_at(d.map_base, ev[0].w2 >> 24) // R-L4
             };
 
             let (mut lo, mut hi) = (0usize, 0usize);
@@ -1384,7 +1486,7 @@ impl Acc {
             let mut k = 0;
             while k < ev.len() {
                 // R-E5: a session runs while the gap to the previous event is <= 30 min.
-                let start = (ev[k].k2 & TS) as i64;
+                let start = ev[k].ts();
                 let day = (d.base + start).div_euclid(DAY_MS) - d.day0; // R-E6
                 if day != cur_day {
                     if cur_day >= 0 {
@@ -1397,14 +1499,15 @@ impl Acc {
                 }
                 let mut prev = start;
                 let (mut s_events, mut s_revenue, mut s_purchase) = (0i64, 0i64, false);
-                while k < ev.len() && (ev[k].k2 & TS) as i64 - prev <= GAP_MS {
+                while k < ev.len() && ev[k].ts() - prev <= GAP_MS {
                     let e = &ev[k];
-                    prev = (e.k2 & TS) as i64;
+                    prev = e.ts();
                     s_events += 1;
-                    if e.typ == T_PURCHASE {
-                        s_revenue += e.price as i64;
+                    if e.w1 & 1 != 0 {
+                        let price = (e.w2 & 0xFF_FFFF) as i64;
+                        s_revenue += price;
                         s_purchase = true;
-                        self.cat_sum[e.cat as usize] += e.price as i64;
+                        self.cat_sum[((e.w1 >> 1) & 0xFF) as usize] += price;
                     }
                     k += 1;
                 }
@@ -1415,8 +1518,8 @@ impl Acc {
 
                 if !pc.is_empty() {
                     // R-K4: clicks with start - 7d <= ts <= start.
-                    while hi < pc.len() && (pc[hi].k2 & TS) as i64 <= start {
-                        let c = pc[hi].camp as usize;
+                    while hi < pc.len() && pc[hi].ts() <= start {
+                        let c = (pc[hi].w2 & 0xFFFF) as usize;
                         self.win_count[c] += 1;
                         if self.win_count[c] == 1 {
                             self.win_pos[c] = self.active.len() as u32;
@@ -1424,8 +1527,8 @@ impl Acc {
                         }
                         hi += 1;
                     }
-                    while lo < hi && ((pc[lo].k2 & TS) as i64) < start - WEEK_MS {
-                        let c = pc[lo].camp as usize;
+                    while lo < hi && pc[lo].ts() < start - WEEK_MS {
+                        let c = (pc[lo].w2 & 0xFFFF) as usize;
                         self.win_count[c] -= 1;
                         if self.win_count[c] == 0 {
                             let p = self.win_pos[c] as usize;
@@ -1438,7 +1541,7 @@ impl Acc {
                         lo += 1;
                     }
                 }
-                let credited = if hi > lo { pc[hi - 1].camp as usize } else { d.organic }; // R-K5
+                let credited = if hi > lo { (pc[hi - 1].w2 & 0xFFFF) as usize } else { d.organic }; // R-K5
                 let cell = credited * ndays + day as usize;
                 self.c_sessions[cell] += 1;
                 self.c_purchasing[cell] += s_purchase as i64;
@@ -1467,13 +1570,18 @@ impl Acc {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if !std::arch::is_x86_feature_detected!("avx2") || !std::arch::is_x86_feature_detected!("bmi2") {
+        eprintln!("this binary is built for x86-64-v3 (AVX2, BMI2), which this CPU does not have");
+        std::process::exit(2);
+    }
     let mut clock = Clock::new();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    if ncpu > 0 {
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global();
-    }
+    // Row ids carry a 4-bit thread number: at most 15 pool threads plus the calling thread.
+    let want = if ncpu > 0 { ncpu } else { std::thread::available_parallelism().map_or(8, |n| n.get()) };
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(want.min(15)).build_global();
 
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = manifest_value(&manifest, "window_start"); // R-T9
@@ -1505,6 +1613,7 @@ fn main() {
     let cat_unknown = cat_names.len() as u16;
     cat_names.push(b"unknown");
     let ncat = cat_names.len();
+    assert!(ncat <= 256, "more than 255 categories: the row layout keeps a category in 8 bits");
 
     // --- campaigns.csv: campaign_id -> dense index, channel ----------------------
     let mut camp_ids: Vec<S> = Vec::new();
@@ -1615,9 +1724,15 @@ fn main() {
     let nthreads = rayon::current_num_threads();
     // One output set per pool thread, plus one for the calling thread (rayon runs tiny jobs inline).
     let outs: Vec<Shared<ThreadOut>> = (0..nthreads + 1).map(|_| Shared::new(ThreadOut::new())).collect();
+    // IDs are kept as 40-bit offsets from the lowest mapped input byte.
+    let map_base = work.iter().map(|w| w.1.as_ptr() as usize).min().unwrap_or(0);
+    let map_end = work.iter().map(|w| w.1.as_ptr() as usize + w.1.len()).max().unwrap_or(0);
+    assert!(map_end - map_base < 1 << 40, "input mappings span more than 1 TiB");
+    let ingest_base = ws - 12 * DAY_MS;
     work.par_iter().for_each(|&(kind, chunk)| {
         // Safety: a pool thread runs one of these closures at a time and never yields inside it.
-        let out = unsafe { outs[rayon::current_thread_index().unwrap_or(nthreads)].get() };
+        let me = rayon::current_thread_index().unwrap_or(nthreads);
+        let out = unsafe { outs[me].get() };
         let mut scan = std::mem::take(&mut out.scan);
         match kind {
             Kind::Events => scan_rows::<7>(chunk, &mut scan, |f| {
@@ -1630,15 +1745,13 @@ fn main() {
                 link_table.prefetch(uh1);
                 let (h1, eh2) = fingerprint(eid);
                 let ingest = tsf.parse(f[3]); // R-T10
-                let mut key = EKey {
-                    h1,
-                    row: 0,
-                    h2: eh2,
-                    ingest: match ingest {
-                        Some(t) => (t - ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32,
-                        None => i32::MAX,
-                    },
+                // R-E2 orders copies by ingest_ts: 22 bits of whole seconds from 12 days before
+                // the window (F1 has no fractions, R-T10); all-ones when unparseable.
+                let ingest22 = match ingest {
+                    Some(t) => (t - ingest_base).div_euclid(1000).clamp(0, INGEST_BITS as i64 - 1) as u64,
+                    None => INGEST_BITS,
                 };
+                let mut id = NO_ROW;
                 'validate: {
                     let Some(ingest) = ingest else { break 'validate };
                     if user.is_empty() || f[5].is_empty() {
@@ -1651,38 +1764,32 @@ fn main() {
                     if ingest - ts > LATE_MS {
                         break 'validate; // R-E4
                     }
-                    let typ = match f[4] {
-                        b"view" => T_VIEW,
-                        b"cart" => T_CART,
-                        b"purchase" => T_PURCHASE,
-                        _ => break 'validate,
-                    };
-                    let price = if typ == T_PURCHASE {
-                        match parse_price(f[6]) {
-                            Some(p) => p,
-                            None => break 'validate,
+                    let (purchase, price, cat) = match f[4] {
+                        b"view" | b"cart" => (0u64, 0u64, 0u64), // price ignored, category not needed
+                        b"purchase" => {
+                            let Some(p) = parse_price(f[6]) else { break 'validate };
+                            // R-E7: the category only matters for purchases (R-O2).
+                            let ph = hash_bytes(f[5]);
+                            (1, p as u64, products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2) as u64)
                         }
-                    } else {
-                        0 // price ignored for view/cart
-                    };
-                    // R-E7: the category only matters for purchases (R-O2), so views and carts
-                    // skip the product lookup; product_id only has to be non-empty (R-E3).
-                    let cat = if typ == T_PURCHASE {
-                        let ph = hash_bytes(f[5]);
-                        products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2)
-                    } else {
-                        0
+                        _ => break 'validate,
                     };
                     let ts_rel = (ts - base) as u64;
                     // R-L4/R-L6: a linked ID belongs to its person, any other ID is its own person.
-                    let (pkey, k2, name, shard) = match link_table.get(uh1, uh2) {
-                        Some(c) => (LINKED | c as u64, ts_rel, 0, (c & 0xFF) as usize),
-                        None => (uh1 & !LINKED, ((uh2 as u64) << 32) | ts_rel, pack_ref(user), shard_of(uh1)),
+                    let (pkey, h2, name, shard) = match link_table.get(uh1, uh2) {
+                        Some(c) => (LINKED | c as u64, 0u64, 0u64, (c & 0xFF) as usize),
+                        None => (uh1 & !LINKED, (uh2 >> 9) as u64, (user.as_ptr() as usize - map_base) as u64, shard_of(uh1)),
                     };
-                    let pkey = pkey.rotate_right(ROT);
-                    key.row = out.ev_rows[shard].push(Row { pkey, k2, name, price, cat, typ, dead: 0 }) as usize;
+                    let row = Row {
+                        w0: pkey.rotate_right(ROT),
+                        w1: (h2 << 41) | (ts_rel << 9) | (cat << 1) | purchase,
+                        w2: (name << 24) | price,
+                    };
+                    let (block, slot) = out.ev_rows[shard].push(row, &mut out.slabs, &mut out.ev_blocks);
+                    id = row_id(me, block, slot);
                 }
-                out.ev_keys[shard_of(h1)].push(key);
+                let key = Key { h1, w: ((eh2 as u64 >> 22) << 54) | (ingest22 << 32) | id as u64 };
+                out.ev_keys[shard_of(h1)].push(key, &mut out.slabs, &mut out.key_blocks);
             }),
             Kind::Clicks => scan_rows::<4>(chunk, &mut scan, |&[cid, user, camp, ts]| {
                 // R-K1..R-K3. Copies of a click are identical, so an invalid line can never
@@ -1699,14 +1806,19 @@ fn main() {
                 let ch = hash_bytes(camp);
                 let Some(e) = campaigns.find(ch, |e| e.0 == ch && e.1 == camp) else { return }; // R-K3: exact match
                 let ts_rel = (t - base) as u64;
-                let (pkey, k2, shard) = match link_table.get(uh1, uh2) {
-                    Some(c) => (LINKED | c as u64, ts_rel, (c & 0xFF) as usize),
-                    None => (uh1 & !LINKED, ((uh2 as u64) << 32) | ts_rel, shard_of(uh1)),
+                let (pkey, h2, shard) = match link_table.get(uh1, uh2) {
+                    Some(c) => (LINKED | c as u64, 0u64, (c & 0xFF) as usize),
+                    None => (uh1 & !LINKED, (uh2 >> 9) as u64, shard_of(uh1)),
                 };
-                let pkey = pkey.rotate_right(ROT);
-                let row = out.cl_rows[shard].push(CRow { pkey, k2, cid: pack_ref(cid), camp: e.2, dead: 0 }) as usize;
+                let row = Row {
+                    w0: pkey.rotate_right(ROT),
+                    w1: (h2 << 41) | (ts_rel << 9),
+                    w2: (((cid.as_ptr() as usize - map_base) as u64) << 16) | e.2 as u64,
+                };
+                let (block, slot) = out.cl_rows[shard].push(row, &mut out.slabs, &mut out.cl_blocks);
                 let (h1, ch2) = fingerprint(cid);
-                out.cl_keys[shard_of(h1)].push(CKey { h1, row, h2: ch2 });
+                let key = Key { h1, w: ((ch2 as u64) << 32) | row_id(me, block, slot) as u64 };
+                out.cl_keys[shard_of(h1)].push(key, &mut out.slabs, &mut out.key_blocks);
             }),
         }
         out.scan = scan;
@@ -1715,22 +1827,27 @@ fn main() {
     clock.log("events and clicks parsed");
 
     // --- dedup, one event_id / click_id shard per task. Losing rows are flagged dead.
+    let ev_tables: Vec<&Vec<*mut Block<Row>>> = outs.iter().map(|o| &o.ev_blocks).collect();
+    let cl_tables: Vec<&Vec<*mut Block<Row>>> = outs.iter().map(|o| &o.cl_blocks).collect();
+    struct Tables<'a>(&'a [&'a Vec<*mut Block<Row>>]);
+    unsafe impl Sync for Tables<'_> {}
+    let (ev_tables, cl_tables) = (Tables(&ev_tables), Tables(&cl_tables));
     (0..NSHARD).into_par_iter().for_each(|s| {
+        let (ev_tables, cl_tables) = (&ev_tables, &cl_tables);
         // R-E2: dedup on event_id BEFORE validation: the copy with the smallest ingest_ts is
         // kept, valid or not; every other copy's row dies.
         let n: usize = outs.iter().map(|o| o.ev_keys[s].len()).sum();
-        let mut table: HashTable<EKey> = HashTable::with_capacity(n);
+        let mut table: HashTable<Key> = HashTable::with_capacity(n);
         for o in &outs {
-            for block in &o.ev_keys[s].blocks {
-                for k in block {
-                    match table.entry(k.h1, |e| e.h1 == k.h1 && e.h2 == k.h2, |e| e.h1) {
+            for &block in &o.ev_keys[s].blocks {
+                for k in unsafe { (*block).items() } {
+                    match table.entry(k.h1, |e| e.h1 == k.h1 && e.w >> 54 == k.w >> 54, |e| e.h1) {
                         Entry::Occupied(mut occ) => {
                             let cur = occ.get_mut();
-                            let loser = if k.ingest < cur.ingest { std::mem::replace(cur, *k).row } else { k.row };
-                            if loser != 0 {
-                                // Safety: a row is referenced by exactly one key, and its key
-                                // lives in this shard only.
-                                unsafe { core::ptr::addr_of_mut!((*(loser as *mut Row)).dead).write(1) };
+                            let earlier = (k.w >> 32) & INGEST_BITS < (cur.w >> 32) & INGEST_BITS;
+                            let loser = if earlier { std::mem::replace(cur, *k).w as u32 } else { k.w as u32 };
+                            if loser != NO_ROW {
+                                kill(ev_tables.0, loser);
                             }
                         }
                         Entry::Vacant(v) => {
@@ -1745,14 +1862,13 @@ fn main() {
         let n: usize = outs.iter().map(|o| o.cl_keys[s].len()).sum();
         let mut table: HashTable<(u64, u32)> = HashTable::with_capacity(n);
         for o in &outs {
-            for block in &o.cl_keys[s].blocks {
-                for k in block {
-                    match table.entry(k.h1, |e| e.0 == k.h1 && e.1 == k.h2, |e| e.0) {
-                        Entry::Occupied(_) => unsafe {
-                            core::ptr::addr_of_mut!((*(k.row as *mut CRow)).dead).write(1)
-                        },
+            for &block in &o.cl_keys[s].blocks {
+                for k in unsafe { (*block).items() } {
+                    let h2 = (k.w >> 32) as u32;
+                    match table.entry(k.h1, |e| e.0 == k.h1 && e.1 == h2, |e| e.0) {
+                        Entry::Occupied(_) => kill(cl_tables.0, k.w as u32),
                         Entry::Vacant(v) => {
-                            v.insert((k.h1, k.h2));
+                            v.insert((k.h1, h2));
                         }
                     }
                 }
@@ -1765,7 +1881,7 @@ fn main() {
     // and a spread of person partitions.
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
-    let dims = Dims { ndays, day0, base, organic, cat_names: &cat_names, names: &names };
+    let dims = Dims { ndays, day0, base, organic, cat_names: &cat_names, names: &names, map_base };
     let ntask = (nthreads * 2).clamp(1, NSHARD);
     let accs: Vec<Acc> = (0..ntask)
         .into_par_iter()
