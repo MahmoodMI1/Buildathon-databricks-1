@@ -10,6 +10,11 @@ memmap2 = "0.9"
 memchr = "2"
 hashbrown = "0.15"
 parquet = { version = "55", default-features = false }
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+default = ["mi"]
+mi = ["dep:mimalloc"]
 
 [profile.release]
 opt-level = 3
