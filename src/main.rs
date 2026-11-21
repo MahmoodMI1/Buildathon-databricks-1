@@ -183,9 +183,21 @@ fn map_file(path: &Path) -> S {
     if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
         return &[];
     }
-    let m = unsafe { memmap2::Mmap::map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
-    let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
-    &m[..]
+    let len = f.metadata().map(|m| m.len()).unwrap() as usize;
+    // MAP_POPULATE maps every page now, from the page cache, so parsing takes no page faults.
+    // Files are mapped from many threads at once (see load_chunks). The mapping is never unmapped.
+    let p = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            std::os::fd::AsRawFd::as_raw_fd(&f),
+            0,
+        )
+    };
+    assert!(p != libc::MAP_FAILED, "mmap {}: {}", path.display(), std::io::Error::last_os_error());
+    unsafe { core::slice::from_raw_parts(p as *const u8, len) }
 }
 
 /// R-C1: every `*.csv` in a directory (or the single file itself), sorted by name.
@@ -210,8 +222,8 @@ fn csv_files(path: &Path) -> Vec<PathBuf> {
 /// R-C3: only `\n` ends a line.
 fn load_chunks(path: &Path) -> Vec<S> {
     let mut out = Vec::new();
-    for file in csv_files(path) {
-        let data = map_file(&file);
+    let maps: Vec<S> = csv_files(path).par_iter().map(|f| map_file(f)).collect();
+    for data in maps {
         let body: S = match memchr(b'\n', data) {
             Some(i) => &data[i + 1..],
             None => continue, // header only, no newline
@@ -479,34 +491,29 @@ fn manifest_value(text: &str, key: &str) -> i64 {
 #[cfg(target_arch = "x86_64")]
 mod simd {
     use core::arch::x86_64::*;
-    /// (bit i set when byte i is `,` or `\n`, bit i set when byte i is `"`) for 64 bytes at `p`.
+    /// (commas, newlines, quotes): bit i set when byte i of the 64 bytes at `p` is that byte.
     #[cfg(target_feature = "avx2")]
     #[inline(always)]
-    pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
+    pub unsafe fn masks3(p: *const u8) -> (u64, u64, u64) {
         let (comma, nl, quote) =
             (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
         let a = _mm256_loadu_si256(p as *const __m256i);
         let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
-        let st_a = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, nl));
-        let st_b = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), _mm256_cmpeq_epi8(b, nl));
-        let st = (_mm256_movemask_epi8(st_a) as u32 as u64) | ((_mm256_movemask_epi8(st_b) as u32 as u64) << 32);
-        let qu = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)) as u32 as u64) << 32);
-        (st, qu)
+        let m = |x: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, c)) as u32 as u64;
+        (m(a, comma) | (m(b, comma) << 32), m(a, nl) | (m(b, nl) << 32), m(a, quote) | (m(b, quote) << 32))
     }
-    /// SSE2 version, for builds without AVX2.
     #[cfg(not(target_feature = "avx2"))]
     #[inline(always)]
-    pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
+    pub unsafe fn masks3(p: *const u8) -> (u64, u64, u64) {
         let (comma, nl, quote) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
-        let (mut st, mut qu) = (0u64, 0u64);
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
         for k in 0..4 {
             let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
-            let s = _mm_or_si128(_mm_cmpeq_epi8(v, comma), _mm_cmpeq_epi8(v, nl));
-            st |= (_mm_movemask_epi8(s) as u32 as u64) << (16 * k);
-            qu |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, quote)) as u32 as u64) << (16 * k);
+            c |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, comma)) as u32 as u64) << (16 * k);
+            n |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, nl)) as u32 as u64) << (16 * k);
+            q |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, quote)) as u32 as u64) << (16 * k);
         }
-        (st, qu)
+        (c, n, q)
     }
 }
 
@@ -522,172 +529,117 @@ mod simd {
         let s = vpaddq_u8(s, s);
         vgetq_lane_u64::<0>(vreinterpretq_u64_u8(s))
     }
-    /// (bit i set when byte i is `,` or `\n`, bit i set when byte i is `"`) for 64 bytes at `p`.
+    /// (commas, newlines, quotes): bit i set when byte i of the 64 bytes at `p` is that byte.
     #[inline(always)]
-    pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
-        let (comma, nl, quote) = (vdupq_n_u8(b','), vdupq_n_u8(b'\n'), vdupq_n_u8(b'"'));
+    pub unsafe fn masks3(p: *const u8) -> (u64, u64, u64) {
         let v = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
-        let st = [
-            vorrq_u8(vceqq_u8(v[0], comma), vceqq_u8(v[0], nl)),
-            vorrq_u8(vceqq_u8(v[1], comma), vceqq_u8(v[1], nl)),
-            vorrq_u8(vceqq_u8(v[2], comma), vceqq_u8(v[2], nl)),
-            vorrq_u8(vceqq_u8(v[3], comma), vceqq_u8(v[3], nl)),
-        ];
-        let qu = [vceqq_u8(v[0], quote), vceqq_u8(v[1], quote), vceqq_u8(v[2], quote), vceqq_u8(v[3], quote)];
-        (bitmask(st), bitmask(qu))
-    }
-}
-
-/// Reusable structural index of one chunk.
-#[derive(Default)]
-struct Scan {
-    pos: Vec<u32>,   // offsets of every `,` and `\n`, in order
-    quote: Vec<u64>, // bit i set when byte i is `"`
-}
-
-impl Scan {
-    #[cfg_attr(feature = "prof", inline(never))]
-    fn index(&mut self, chunk: S) {
-        let len = chunk.len();
-        assert!(len < u32::MAX as usize - 128);
-        let base = chunk.as_ptr();
-        self.pos.clear();
-        self.pos.reserve(len + 80); // worst case: every byte is structural
-        self.quote.clear();
-        self.quote.resize(len / 64 + 2, 0);
-        let out = self.pos.as_mut_ptr();
-        let mut n = 0usize;
-        let mut i = 0usize;
-        let emit = |i: usize, st: u64, n: &mut usize| unsafe {
-            // Write 8 slots unconditionally (branch-free for the common case), more if needed.
-            let cnt = st.count_ones() as usize;
-            let mut m = st;
-            let mut w = out.add(*n);
-            for _ in 0..8 {
-                *w = i as u32 + m.trailing_zeros();
-                m &= m.wrapping_sub(1);
-                w = w.add(1);
-            }
-            if cnt > 8 {
-                for _ in 8..cnt {
-                    *w = i as u32 + m.trailing_zeros();
-                    m &= m.wrapping_sub(1);
-                    w = w.add(1);
-                }
-            }
-            *n += cnt;
+        let m = |c: u8| {
+            let d = vdupq_n_u8(c);
+            bitmask([vceqq_u8(v[0], d), vceqq_u8(v[1], d), vceqq_u8(v[2], d), vceqq_u8(v[3], d)])
         };
-        while i + 64 <= len {
-            let (st, qu) = unsafe { simd::masks64(base.add(i)) };
-            self.quote[i >> 6] = qu;
-            emit(i, st, &mut n);
-            i += 64;
-        }
-        if i < len {
-            let mut tail = [0u8; 64]; // zero is not a structural byte
-            tail[..len - i].copy_from_slice(&chunk[i..]);
-            let (st, qu) = unsafe { simd::masks64(tail.as_ptr()) };
-            self.quote[i >> 6] = qu;
-            emit(i, st, &mut n);
-        }
-        if len > 0 && chunk[len - 1] != b'\n' {
-            unsafe { *out.add(n) = len as u32 }; // a last line without `\n` is a line (Q1)
-            n += 1;
-        }
-        unsafe { self.pos.set_len(n) };
-    }
-
-    /// Number of quotes in bytes [a, b).
-    #[inline(always)]
-    fn quotes_in(&self, a: usize, b: usize) -> u32 {
-        let (wa, wb) = (a >> 6, b >> 6);
-        let q = &self.quote;
-        unsafe {
-            if wa == wb {
-                return ((*q.get_unchecked(wa) >> (a & 63)) & ((1u64 << (b - a)) - 1)).count_ones();
-            }
-            let mut c = (*q.get_unchecked(wa) >> (a & 63)).count_ones();
-            for w in wa + 1..wb {
-                c += q.get_unchecked(w).count_ones();
-            }
-            if b & 63 != 0 {
-                c += (*q.get_unchecked(wb) & ((1u64 << (b & 63)) - 1)).count_ones();
-            }
-            c
-        }
+        (m(b','), m(b'\n'), m(b'"'))
     }
 }
+
+/// Kept for the call signature; the fused scanner needs no per-thread state.
+#[derive(Default)]
+struct Scan;
 
 /// Calls `on_row` with the N fields of every well-formed line of a chunk.
+/// One pass: every 64-byte block becomes three bitmasks (commas, newlines, quotes) and
+/// lines are cut straight from them; nothing is written to memory in between.
 /// R-C3: only `\n` ends a line; a last line without `\n` is a line (Q1).
 /// R-C4: every comma separates fields; the count must be exactly N.
 /// R-C5..R-C7: a field may be wrapped in quotes as a whole (stripped here); any other
 /// quote, a wrong field count or an empty line makes the line malformed and it is skipped.
 /// An empty slice is a null field (R-C6).
-#[inline(always)]
-fn scan_rows<const N: usize>(chunk: S, sc: &mut Scan, mut on_row: impl FnMut(&[S; N])) {
-    sc.index(chunk);
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+fn scan_rows<const N: usize>(chunk: S, _sc: &mut Scan, mut on_row: impl FnMut(&[S; N])) {
     let len = chunk.len();
+    assert!(len < u32::MAX as usize - 128);
     let base = chunk.as_ptr();
-    let pos = &sc.pos[..];
-    let np = pos.len();
-    let byte = |p: u32| -> u8 { unsafe { *base.add(p as usize) } };
-    let is_nl = |p: u32| -> bool { p as usize == len || byte(p) == b'\n' };
-    let mut fields: [S; N] = [&[]; N];
-    let mut i = 0usize; // index into pos of the first structural byte of the current line
-    let mut line_start = 0usize;
-    while i < np {
-        // Well-formed shape: N-1 commas, then the newline.
-        let mut ok = i + N <= np;
-        if ok {
-            for k in 0..N - 1 {
-                ok &= (pos[i + k] as usize) < len && byte(pos[i + k]) == b',';
-            }
-            ok &= is_nl(pos[i + N - 1]);
-        }
-        if !ok {
-            // Wrong field count (or an empty line): skip to after this line's newline.
-            let mut j = i;
-            while j < np && !is_nl(pos[j]) {
-                j += 1;
-            }
-            if j >= np {
-                break;
-            }
-            line_start = pos[j] as usize + 1;
-            i = j + 1;
-            continue;
-        }
-        let end = pos[i + N - 1] as usize;
+    let mut emit = |line_start: usize, commas: &[u32; N], end: usize, nq: u32| {
+        let mut fields: [S; N] = [&[]; N];
         let mut s = line_start;
         for k in 0..N {
-            let e = pos[i + k] as usize;
+            let e = if k + 1 < N { commas[k] as usize } else { end };
             fields[k] = unsafe { core::slice::from_raw_parts(base.add(s), e - s) };
             s = e + 1;
         }
-        i += N;
-        let total_quotes = sc.quotes_in(line_start, end);
-        line_start = end + 1;
-        if total_quotes != 0 {
+        if nq != 0 {
             // Every quote must be the first or last byte of a field that has both.
             let mut wrapped = 0u32;
-            let mut bad = false;
             for f in fields.iter_mut() {
                 if !f.is_empty() && f[0] == b'"' {
                     let l = f.len();
                     if l < 2 || f[l - 1] != b'"' {
-                        bad = true;
-                        break;
+                        return; // R-C7
                     }
                     *f = &f[1..l - 1];
                     wrapped += 2;
                 }
             }
-            if bad || wrapped != total_quotes {
-                continue; // R-C7
+            if wrapped != nq {
+                return; // R-C7
             }
         }
         on_row(&fields);
+    };
+    let mut commas = [0u32; N]; // commas of the current line; the last slot is never used
+    let mut nc = 0usize; // commas of the current line so far; N means "too many"
+    let mut nq = 0u32; // quotes of the current line so far
+    let mut line_start = 0usize;
+    let mut tail = [0u8; 64]; // zero padding: never a structural byte
+    let mut i = 0usize;
+    while i < len {
+        let (mut cm, mut nm, mut qm) = unsafe {
+            if i + 64 <= len {
+                simd::masks3(base.add(i))
+            } else {
+                tail[..len - i].copy_from_slice(&chunk[i..]);
+                simd::masks3(tail.as_ptr())
+            }
+        };
+        while nm != 0 {
+            let bit = nm.trailing_zeros();
+            let below = (1u64 << bit) - 1;
+            let cs = cm & below;
+            let k = cs.count_ones() as usize;
+            nq += (qm & below).count_ones();
+            let end = i + bit as usize;
+            if nc + k == N - 1 {
+                let mut m = cs;
+                for slot in commas.iter_mut().take(N - 1).skip(nc) {
+                    *slot = i as u32 + m.trailing_zeros();
+                    m &= m.wrapping_sub(1);
+                }
+                emit(line_start, &commas, end, nq);
+            }
+            let upto = below | (1u64 << bit);
+            cm &= !upto;
+            qm &= !upto;
+            nm &= nm - 1;
+            nc = 0;
+            nq = 0;
+            line_start = end + 1;
+        }
+        // What is left of the block continues the current line.
+        let k = cm.count_ones() as usize;
+        if nc + k <= N - 1 {
+            while cm != 0 {
+                commas[nc] = i as u32 + cm.trailing_zeros();
+                nc += 1;
+                cm &= cm - 1;
+            }
+        } else {
+            nc = N;
+        }
+        nq += qm.count_ones();
+        i += 64;
+    }
+    if line_start < len && nc == N - 1 {
+        emit(line_start, &commas, len, nq); // a last line without `\n` (Q1)
     }
 }
 
@@ -1005,8 +957,35 @@ impl<T> Bucket<T> {
     }
 }
 
+/// A valid event waiting for its link-table lookup (the slot was prefetched when it was parsed).
+#[derive(Clone, Copy)]
+struct PendEv {
+    uh1: u64,
+    uh2: u32,
+    name: u64, // user ID offset
+    w1: u64,   // ts_rel << 9 | cat << 1 | purchase
+    price: u64,
+    h1: u64, // event_id fingerprint
+    kw: u64, // key word without the row id
+}
+
+/// A valid click waiting for its link-table lookup.
+#[derive(Clone, Copy)]
+struct PendCl {
+    uh1: u64,
+    uh2: u32,
+    w1: u64, // ts_rel << 9
+    w2: u64, // click_id offset << 16 | campaign
+    h1: u64, // click_id fingerprint
+    ch2: u32,
+}
+
+const PEND: usize = 32;
+
 /// Everything one parser thread produces, bucketed by shard.
 struct ThreadOut {
+    pend_ev: Vec<PendEv>,
+    pend_cl: Vec<PendCl>,
     scan: Scan,
     slabs: Slabs,
     ev_keys: Vec<Bucket<Key>>, // by event_id shard
@@ -1026,6 +1005,8 @@ unsafe impl Sync for ThreadOut {}
 impl ThreadOut {
     fn new() -> Self {
         ThreadOut {
+            pend_ev: Vec::with_capacity(PEND),
+            pend_cl: Vec::with_capacity(PEND),
             scan: Scan::default(),
             slabs: Slabs { cur: 0, end: 0 },
             ev_keys: (0..NSHARD).map(|_| Bucket::new()).collect(),
@@ -1037,6 +1018,42 @@ impl ThreadOut {
             key_blocks: Vec::new(),
         }
     }
+}
+
+/// Resolves queued events against the link table and stores them (R-L4/R-L6: a linked ID
+/// belongs to its person, any other ID is its own person).
+#[inline(always)]
+fn flush_ev(out: &mut ThreadOut, me: usize, lt: &LinkTable) {
+    let pend = std::mem::take(&mut out.pend_ev);
+    for p in &pend {
+        let (pkey, h2, name, shard) = match lt.get(p.uh1, p.uh2) {
+            Some(c) => (LINKED | c as u64, 0u64, 0u64, (c & 0xFF) as usize),
+            None => (p.uh1 & !LINKED, (p.uh2 >> 9) as u64, p.name, shard_of(p.uh1)),
+        };
+        let row = Row { w0: pkey.rotate_right(ROT), w1: (h2 << 41) | p.w1, w2: (name << 24) | p.price };
+        let (block, slot) = out.ev_rows[shard].push(row, &mut out.slabs, &mut out.ev_blocks);
+        let key = Key { h1: p.h1, w: p.kw | row_id(me, block, slot) as u64 };
+        out.ev_keys[shard_of(p.h1)].push(key, &mut out.slabs, &mut out.key_blocks);
+    }
+    out.pend_ev = pend;
+    out.pend_ev.clear();
+}
+
+#[inline(always)]
+fn flush_cl(out: &mut ThreadOut, me: usize, lt: &LinkTable) {
+    let pend = std::mem::take(&mut out.pend_cl);
+    for p in &pend {
+        let (pkey, h2, shard) = match lt.get(p.uh1, p.uh2) {
+            Some(c) => (LINKED | c as u64, 0u64, (c & 0xFF) as usize),
+            None => (p.uh1 & !LINKED, (p.uh2 >> 9) as u64, shard_of(p.uh1)),
+        };
+        let row = Row { w0: pkey.rotate_right(ROT), w1: (h2 << 41) | p.w1, w2: p.w2 };
+        let (block, slot) = out.cl_rows[shard].push(row, &mut out.slabs, &mut out.cl_blocks);
+        let key = Key { h1: p.h1, w: ((p.ch2 as u64) << 32) | row_id(me, block, slot) as u64 };
+        out.cl_keys[shard_of(p.h1)].push(key, &mut out.slabs, &mut out.key_blocks);
+    }
+    out.pend_cl = pend;
+    out.pend_cl.clear();
 }
 
 #[inline(always)]
@@ -1751,7 +1768,7 @@ fn main() {
                     Some(t) => (t - ingest_base).div_euclid(1000).clamp(0, INGEST_BITS as i64 - 1) as u64,
                     None => INGEST_BITS,
                 };
-                let mut id = NO_ROW;
+                let kw = ((eh2 as u64 >> 22) << 54) | (ingest22 << 32);
                 'validate: {
                     let Some(ingest) = ingest else { break 'validate };
                     if user.is_empty() || f[5].is_empty() {
@@ -1775,21 +1792,22 @@ fn main() {
                         _ => break 'validate,
                     };
                     let ts_rel = (ts - base) as u64;
-                    // R-L4/R-L6: a linked ID belongs to its person, any other ID is its own person.
-                    let (pkey, h2, name, shard) = match link_table.get(uh1, uh2) {
-                        Some(c) => (LINKED | c as u64, 0u64, 0u64, (c & 0xFF) as usize),
-                        None => (uh1 & !LINKED, (uh2 >> 9) as u64, (user.as_ptr() as usize - map_base) as u64, shard_of(uh1)),
-                    };
-                    let row = Row {
-                        w0: pkey.rotate_right(ROT),
-                        w1: (h2 << 41) | (ts_rel << 9) | (cat << 1) | purchase,
-                        w2: (name << 24) | price,
-                    };
-                    let (block, slot) = out.ev_rows[shard].push(row, &mut out.slabs, &mut out.ev_blocks);
-                    id = row_id(me, block, slot);
+                    out.pend_ev.push(PendEv {
+                        uh1,
+                        uh2,
+                        name: (user.as_ptr() as usize - map_base) as u64,
+                        w1: (ts_rel << 9) | (cat << 1) | purchase,
+                        price,
+                        h1,
+                        kw,
+                    });
+                    if out.pend_ev.len() == PEND {
+                        flush_ev(out, me, &link_table);
+                    }
+                    return;
                 }
-                let key = Key { h1, w: ((eh2 as u64 >> 22) << 54) | (ingest22 << 32) | id as u64 };
-                out.ev_keys[shard_of(h1)].push(key, &mut out.slabs, &mut out.key_blocks);
+                // An invalid copy still takes part in dedup (R-E2), without a row.
+                out.ev_keys[shard_of(h1)].push(Key { h1, w: kw | NO_ROW as u64 }, &mut out.slabs, &mut out.key_blocks);
             }),
             Kind::Clicks => scan_rows::<4>(chunk, &mut scan, |&[cid, user, camp, ts]| {
                 // R-K1..R-K3. Copies of a click are identical, so an invalid line can never
@@ -1806,21 +1824,22 @@ fn main() {
                 let ch = hash_bytes(camp);
                 let Some(e) = campaigns.find(ch, |e| e.0 == ch && e.1 == camp) else { return }; // R-K3: exact match
                 let ts_rel = (t - base) as u64;
-                let (pkey, h2, shard) = match link_table.get(uh1, uh2) {
-                    Some(c) => (LINKED | c as u64, 0u64, (c & 0xFF) as usize),
-                    None => (uh1 & !LINKED, (uh2 >> 9) as u64, shard_of(uh1)),
-                };
-                let row = Row {
-                    w0: pkey.rotate_right(ROT),
-                    w1: (h2 << 41) | (ts_rel << 9),
-                    w2: (((cid.as_ptr() as usize - map_base) as u64) << 16) | e.2 as u64,
-                };
-                let (block, slot) = out.cl_rows[shard].push(row, &mut out.slabs, &mut out.cl_blocks);
                 let (h1, ch2) = fingerprint(cid);
-                let key = Key { h1, w: ((ch2 as u64) << 32) | row_id(me, block, slot) as u64 };
-                out.cl_keys[shard_of(h1)].push(key, &mut out.slabs, &mut out.key_blocks);
+                out.pend_cl.push(PendCl {
+                    uh1,
+                    uh2,
+                    w1: ts_rel << 9,
+                    w2: (((cid.as_ptr() as usize - map_base) as u64) << 16) | e.2 as u64,
+                    h1,
+                    ch2,
+                });
+                if out.pend_cl.len() == PEND {
+                    flush_cl(out, me, &link_table);
+                }
             }),
         }
+        flush_ev(out, me, &link_table);
+        flush_cl(out, me, &link_table);
         out.scan = scan;
     });
     let outs: Vec<ThreadOut> = outs.into_iter().map(|s| s.0.into_inner()).collect();
@@ -1832,12 +1851,17 @@ fn main() {
     struct Tables<'a>(&'a [&'a Vec<*mut Block<Row>>]);
     unsafe impl Sync for Tables<'_> {}
     let (ev_tables, cl_tables) = (Tables(&ev_tables), Tables(&cl_tables));
-    (0..NSHARD).into_par_iter().for_each(|s| {
+    // One pair of tables per worker, cleared and reused for each shard: no fresh memory per shard.
+    (0..NSHARD).into_par_iter().for_each_init(
+        || (HashTable::<Key>::new(), HashTable::<(u64, u32)>::new()),
+        |(ev_table, cl_table), s| {
         let (ev_tables, cl_tables) = (&ev_tables, &cl_tables);
         // R-E2: dedup on event_id BEFORE validation: the copy with the smallest ingest_ts is
         // kept, valid or not; every other copy's row dies.
         let n: usize = outs.iter().map(|o| o.ev_keys[s].len()).sum();
-        let mut table: HashTable<Key> = HashTable::with_capacity(n);
+        let table = ev_table;
+        table.clear();
+        table.reserve(n, |e| e.h1);
         for o in &outs {
             for &block in &o.ev_keys[s].blocks {
                 for k in unsafe { (*block).items() } {
@@ -1857,10 +1881,11 @@ fn main() {
                 }
             }
         }
-        drop(table);
         // R-K2: keep the first copy of a click, flag the rest.
         let n: usize = outs.iter().map(|o| o.cl_keys[s].len()).sum();
-        let mut table: HashTable<(u64, u32)> = HashTable::with_capacity(n);
+        let table = cl_table;
+        table.clear();
+        table.reserve(n, |e| e.0);
         for o in &outs {
             for &block in &o.cl_keys[s].blocks {
                 for k in unsafe { (*block).items() } {
@@ -1874,7 +1899,8 @@ fn main() {
                 }
             }
         }
-    });
+        },
+    );
     clock.log("deduped");
 
     // --- sessions, credit, assists: a fixed number of tasks, each with one accumulator
