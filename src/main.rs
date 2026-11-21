@@ -19,9 +19,60 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use rayon::prelude::*;
 
-#[cfg(feature = "mi")]
+#[cfg(all(feature = "mi", not(feature = "prof")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Profiling build only: counts allocation calls and bytes on top of the real allocator.
+#[cfg(feature = "prof")]
+mod prof_alloc {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub struct Counting;
+    #[cfg(feature = "mi")]
+    static INNER: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    #[cfg(not(feature = "mi"))]
+    static INNER: std::alloc::System = std::alloc::System;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            CALLS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(l.size() as u64, Relaxed);
+            INNER.alloc(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            INNER.dealloc(p, l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            CALLS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(n.saturating_sub(l.size()) as u64, Relaxed);
+            INNER.realloc(p, l, n)
+        }
+    }
+}
+#[cfg(feature = "prof")]
+#[global_allocator]
+static GLOBAL: prof_alloc::Counting = prof_alloc::Counting;
+
+/// Page faults and peak memory from /proc, printed when PROF is set.
+fn proc_stats() -> String {
+    let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let after = stat.rsplit(')').next().unwrap_or("");
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let (minflt, majflt) = (f.get(7).copied().unwrap_or("?"), f.get(9).copied().unwrap_or("?"));
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let hwm = status.lines().find(|l| l.starts_with("VmHWM")).unwrap_or("VmHWM ?").replace('\t', " ");
+    #[cfg(feature = "prof")]
+    let alloc = format!(
+        ", alloc calls={} bytes={:.0}MB",
+        prof_alloc::CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        prof_alloc::BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1048576.0
+    );
+    #[cfg(not(feature = "prof"))]
+    let alloc = String::new();
+    format!("minflt={minflt} majflt={majflt} {hwm}{alloc}")
+}
 
 /// A byte slice into a memory-mapped input file. The maps are leaked on purpose:
 /// they live for the whole run, so fields can be kept as zero-copy slices.
@@ -499,7 +550,7 @@ fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
 }
 
 /// A value that tasks may mutate through a shared reference. Callers guarantee that
-/// every value is touched by one task at a time (each task owns one shard).
+/// every value is touched by one task at a time.
 struct Shared<T>(std::cell::UnsafeCell<T>);
 unsafe impl<T: Send> Sync for Shared<T> {}
 impl<T> Shared<T> {
@@ -510,97 +561,181 @@ impl<T> Shared<T> {
     unsafe fn get(&self) -> &mut T {
         &mut *self.0.get()
     }
+    unsafe fn peek(&self) -> &T {
+        &*self.0.get()
+    }
 }
 
 #[inline(always)]
-fn bytes_at(ptr: usize, len: u32) -> S {
-    unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+}
+
+/// A byte slice of a mapped file packed into 64 bits: 48-bit address, 16-bit length.
+#[inline(always)]
+fn pack_ref(b: S) -> u64 {
+    assert!(b.len() < 65_536, "ID longer than 64 KiB");
+    (b.as_ptr() as u64) | ((b.len() as u64) << 48)
+}
+
+#[inline(always)]
+fn unpack_ref(r: u64) -> S {
+    unsafe { core::slice::from_raw_parts((r & 0xFFFF_FFFF_FFFF) as *const u8, (r >> 48) as usize) }
 }
 
 // ---------------------------------------------------------------------------
-// Records. Timestamps of valid rows are stored relative to `base` = window_start - 7 days
-// (the earliest valid click), which fits a u32 of milliseconds for any window under 42 days.
+// Link table: read-only map from a linked user ID (by fingerprint) to its person,
+// probed while parsing. 256 independent regions, one per hash shard, so it is built
+// in parallel and a lookup touches one region.
 // ---------------------------------------------------------------------------
 
-/// One well-formed event line with a non-empty event_id, before dedup (R-E1). 64 bytes.
 #[derive(Clone, Copy)]
-struct ERec {
-    hash: u64, // of event_id
-    eid_ptr: usize,
-    user_ptr: usize,
-    uh1: u64, // user fingerprint
-    ingest: i64,
-    eid_len: u32,
-    user_len: u32,
-    uh2: u32,
-    ts_rel: u32,
+struct LinkSlot {
+    h1: u64,
+    canon: u32, // id of the ID that names the person; u32::MAX = empty slot
+    h2: u32,
+}
+
+struct LinkTable {
+    slots: Vec<LinkSlot>,
+    rbits: u32, // each region has 1 << rbits slots
+}
+
+impl LinkTable {
+    #[inline(always)]
+    fn start(&self, h1: u64) -> (usize, usize, usize) {
+        let mask = (1usize << self.rbits) - 1;
+        (shard_of(h1) << self.rbits, ((h1 >> 8) as usize) & mask, mask)
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, h1: u64) {
+        let (base, i, _) = self.start(h1);
+        prefetch(unsafe { self.slots.as_ptr().add(base | i) });
+    }
+
+    #[inline(always)]
+    fn get(&self, h1: u64, h2: u32) -> Option<u32> {
+        let (base, mut i, mask) = self.start(h1);
+        loop {
+            let s = unsafe { self.slots.get_unchecked(base | i) };
+            if s.canon == u32::MAX {
+                return None;
+            }
+            if s.h1 == h1 && s.h2 == h2 {
+                return Some(s.canon);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rows. A person is identified by (pkey, h2):
+//   linked ID   -> pkey = 1 << 63 | id of the naming ID, h2 = 0
+//   other user  -> pkey = hash_bytes(user) with bit 63 cleared, h2 = hash_bytes2(user)
+// k2 = h2 << 32 | ts_rel, so sorting by (pkey, k2) groups a person and orders by time.
+// Timestamps are relative to `base` = window_start - 7 days (the earliest valid click).
+// ---------------------------------------------------------------------------
+
+const LINKED: u64 = 1 << 63;
+
+/// A valid event, written once while parsing into its person's partition. 32 bytes.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Row {
+    pkey: u64,
+    k2: u64,
+    name: u64, // packed user ID bytes (unused for linked persons)
     price: u32,
     cat: u16,
     typ: u8,
-    valid: bool, // passes R-E3 and R-E4, and is the kept copy once dedup has run
+    dead: u8, // set by dedup when another copy of the event wins (R-E2)
 }
 
-/// A surviving event whose user is not resolved to a person yet. 40 bytes.
+/// A valid click. 32 bytes.
 #[derive(Clone, Copy)]
-struct SEv {
-    uh1: u64,
-    user_ptr: usize,
-    user_len: u32,
-    uh2: u32,
-    ts_rel: u32,
-    price: u32,
-    cat: u16,
-    typ: u8,
-}
-
-/// A surviving event. key = person << 32 | ts_rel. 16 bytes.
-#[derive(Clone, Copy)]
-struct Ev {
-    key: u64,
-    price: u32,
-    cat: u16,
-    typ: u8,
-}
-
-/// One well-formed click line with a non-empty click_id, before dedup (R-K1). 56 bytes.
-#[derive(Clone, Copy)]
-struct CRec {
-    hash: u64, // of click_id
-    cid_ptr: usize,
-    user_ptr: usize,
-    uh1: u64,
-    cid_len: u32,
-    user_len: u32,
-    uh2: u32,
-    ts_rel: u32,
+#[repr(C)]
+struct CRow {
+    pkey: u64,
+    k2: u64,
+    cid: u64, // packed click_id bytes, for the R-K4 tie-break
     camp: u16,
-    valid: bool, // passes R-K3, and is the kept copy once dedup has run
+    dead: u8, // set by dedup for every copy after the first (R-K2)
 }
 
-/// A valid click whose user is not resolved to a person yet.
+/// Dedup key of one well-formed event line (R-E1, R-E2). 24 bytes.
+/// (h1, h2) is the 96-bit fingerprint of event_id.
 #[derive(Clone, Copy)]
-struct SClick {
-    uh1: u64,
-    user_ptr: usize,
-    cid_ptr: usize,
-    user_len: u32,
-    cid_len: u32,
-    uh2: u32,
-    ts_rel: u32,
-    camp: u16,
+struct EKey {
+    h1: u64,
+    row: usize, // address of its Row, 0 when this copy is invalid (R-E3, R-E4)
+    h2: u32,
+    ingest: i32, // seconds relative to window_start; i32::MAX when unparseable
 }
 
-/// A valid click. key = person << 32 | ts_rel. 24 bytes.
+/// Dedup key of one valid click line (R-K2).
 #[derive(Clone, Copy)]
-struct Click {
-    key: u64,
-    cid_ptr: usize,
-    cid_len: u32,
-    camp: u16,
+struct CKey {
+    h1: u64,
+    row: usize,
+    h2: u32,
 }
 
-fn buckets<T>(reserve_each: usize) -> Vec<Vec<T>> {
-    (0..NSHARD).map(|_| Vec::with_capacity(reserve_each)).collect()
+/// Append-only buffer made of fixed-size blocks: element addresses stay valid, and
+/// nothing is reserved beyond the current block.
+struct BlockBuf<T> {
+    blocks: Vec<Vec<T>>,
+}
+
+impl<T> BlockBuf<T> {
+    const BLOCK: usize = 512;
+    fn new() -> Self {
+        BlockBuf { blocks: Vec::new() }
+    }
+    #[inline(always)]
+    fn push(&mut self, v: T) -> *mut T {
+        if self.blocks.last().map_or(true, |b| b.len() == b.capacity()) {
+            self.blocks.push(Vec::with_capacity(Self::BLOCK));
+        }
+        let b = self.blocks.last_mut().unwrap();
+        let n = b.len();
+        unsafe {
+            let p = b.as_mut_ptr().add(n);
+            p.write(v);
+            b.set_len(n + 1);
+            p
+        }
+    }
+    fn len(&self) -> usize {
+        self.blocks.iter().map(|b| b.len()).sum()
+    }
+}
+
+/// Everything one parser thread produces, bucketed by shard.
+struct ThreadOut {
+    ev_keys: Vec<BlockBuf<EKey>>, // by event_id shard
+    ev_rows: Vec<BlockBuf<Row>>,  // by person shard
+    cl_keys: Vec<BlockBuf<CKey>>, // by click_id shard
+    cl_rows: Vec<BlockBuf<CRow>>, // by person shard
+}
+
+impl ThreadOut {
+    fn new() -> Self {
+        ThreadOut {
+            ev_keys: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
+            ev_rows: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
+            cl_keys: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
+            cl_rows: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -694,8 +829,8 @@ struct Acc {
     win_pos: Vec<u32>,
     active: Vec<u16>,
     cat_sum: Vec<i64>,
-    events: Vec<Ev>,
-    clicks: Vec<Click>,
+    events: Vec<Row>,
+    clicks: Vec<CRow>,
     n_sessions: u64,
 }
 
@@ -705,7 +840,7 @@ struct Dims<'a> {
     base: i64, // ts = base + ts_rel
     organic: usize,
     cat_names: &'a [S],
-    names: &'a [Vec<S>], // names[shard][index within shard]
+    names: &'a [Vec<S>], // linked IDs: names[shard][index within shard]
 }
 
 impl Acc {
@@ -734,7 +869,7 @@ impl Acc {
     /// R-O2: close one (person, day) row. top_category = highest summed purchase price,
     /// tie -> byte-wise smallest name, null without purchases.
     #[inline]
-    fn flush_day(&mut self, d: &Dims, person: u32, day: i64, sessions: i64, events: i64, revenue: i64) {
+    fn flush_day(&mut self, d: &Dims, name: S, day: i64, sessions: i64, events: i64, revenue: i64) {
         let mut top: Option<usize> = None;
         if revenue > 0 {
             for c in 0..self.cat_sum.len() {
@@ -750,7 +885,7 @@ impl Acc {
             }
             self.cat_sum.fill(0);
         }
-        self.u_user.push(d.names[(person & 0xFF) as usize][(person >> 8) as usize]);
+        self.u_user.push(name);
         self.u_day.push((d.day0 + day) as i32);
         self.u_sessions.push(sessions);
         self.u_events.push(events);
@@ -763,13 +898,12 @@ impl Acc {
     fn process(&mut self, d: &Dims) {
         let mut events = std::mem::take(&mut self.events);
         let mut clicks = std::mem::take(&mut self.clicks);
-        // key = person << 32 | ts. Ties in ts need no order: one pass decides the sessions,
-        // so tied events cannot split.
-        events.sort_unstable_by_key(|e| e.key);
+        // Ties in ts need no order: one pass decides the sessions, so tied events cannot split.
+        events.sort_unstable_by_key(|e| (e.pkey, e.k2));
         // Within a ts, click_id DESCENDING: the last click at or before a session start is
         // then the latest one with the smallest click_id (R-K4).
         clicks.sort_unstable_by(|a, b| {
-            a.key.cmp(&b.key).then_with(|| bytes_at(b.cid_ptr, b.cid_len).cmp(bytes_at(a.cid_ptr, a.cid_len)))
+            (a.pkey, a.k2).cmp(&(b.pkey, b.k2)).then_with(|| unpack_ref(b.cid).cmp(unpack_ref(a.cid)))
         });
 
         const TS: u64 = 0xFFFF_FFFF;
@@ -777,22 +911,28 @@ impl Acc {
         let n = events.len();
         let (mut i, mut ci) = (0usize, 0usize);
         while i < n {
-            let pkey = events[i].key >> 32;
-            let person = pkey as u32;
+            // One person = one (pkey, h2); h2 is the high half of k2.
+            let pid = (events[i].pkey, events[i].k2 >> 32);
             let mut j = i;
-            while j < n && events[j].key >> 32 == pkey {
+            while j < n && (events[j].pkey, events[j].k2 >> 32) == pid {
                 j += 1;
             }
-            while ci < clicks.len() && clicks[ci].key >> 32 < pkey {
+            while ci < clicks.len() && (clicks[ci].pkey, clicks[ci].k2 >> 32) < pid {
                 ci += 1;
             }
             let cs = ci;
-            while ci < clicks.len() && clicks[ci].key >> 32 == pkey {
+            while ci < clicks.len() && (clicks[ci].pkey, clicks[ci].k2 >> 32) == pid {
                 ci += 1;
             }
             let ev = &events[i..j];
             let pc = &clicks[cs..ci];
             i = j;
+            let name: S = if pid.0 & LINKED != 0 {
+                let id = pid.0 as u32;
+                d.names[(id & 0xFF) as usize][(id >> 8) as usize] // R-L3
+            } else {
+                unpack_ref(ev[0].name) // R-L4
+            };
 
             let (mut lo, mut hi) = (0usize, 0usize);
             let mut cur_day: i64 = -1;
@@ -800,11 +940,11 @@ impl Acc {
             let mut k = 0;
             while k < ev.len() {
                 // R-E5: a session runs while the gap to the previous event is <= 30 min.
-                let start = (ev[k].key & TS) as i64;
+                let start = (ev[k].k2 & TS) as i64;
                 let day = (d.base + start).div_euclid(DAY_MS) - d.day0; // R-E6
                 if day != cur_day {
                     if cur_day >= 0 {
-                        self.flush_day(d, person, cur_day, d_sessions, d_events, d_revenue);
+                        self.flush_day(d, name, cur_day, d_sessions, d_events, d_revenue);
                     }
                     cur_day = day;
                     d_sessions = 0;
@@ -813,9 +953,9 @@ impl Acc {
                 }
                 let mut prev = start;
                 let (mut s_events, mut s_revenue, mut s_purchase) = (0i64, 0i64, false);
-                while k < ev.len() && (ev[k].key & TS) as i64 - prev <= GAP_MS {
+                while k < ev.len() && (ev[k].k2 & TS) as i64 - prev <= GAP_MS {
                     let e = &ev[k];
-                    prev = (e.key & TS) as i64;
+                    prev = (e.k2 & TS) as i64;
                     s_events += 1;
                     if e.typ == T_PURCHASE {
                         s_revenue += e.price as i64;
@@ -831,7 +971,7 @@ impl Acc {
 
                 if !pc.is_empty() {
                     // R-K4: clicks with start - 7d <= ts <= start.
-                    while hi < pc.len() && (pc[hi].key & TS) as i64 <= start {
+                    while hi < pc.len() && (pc[hi].k2 & TS) as i64 <= start {
                         let c = pc[hi].camp as usize;
                         self.win_count[c] += 1;
                         if self.win_count[c] == 1 {
@@ -840,7 +980,7 @@ impl Acc {
                         }
                         hi += 1;
                     }
-                    while lo < hi && ((pc[lo].key & TS) as i64) < start - WEEK_MS {
+                    while lo < hi && ((pc[lo].k2 & TS) as i64) < start - WEEK_MS {
                         let c = pc[lo].camp as usize;
                         self.win_count[c] -= 1;
                         if self.win_count[c] == 0 {
@@ -864,7 +1004,7 @@ impl Acc {
                 }
             }
             if cur_day >= 0 {
-                self.flush_day(d, person, cur_day, d_sessions, d_events, d_revenue);
+                self.flush_day(d, name, cur_day, d_sessions, d_events, d_revenue);
             }
             for &c in &self.active {
                 self.win_count[c as usize] = 0;
@@ -966,18 +1106,19 @@ fn main() {
         }
     }
     // best[root] = id whose string is the byte-wise smallest in the component (R-L3);
-    // canon[id] = the id that names the person. Other IDs are their own person (R-L4).
+    // canon[id] = the id that names the person.
     let mut canon: Vec<u32> = (0..link_space as u32).collect();
+    let shards: Vec<InternShard> =
+        interner.shards.into_iter().map(|s| s.into_inner().unwrap()).collect();
     {
-        let guards: Vec<_> = interner.shards.iter().map(|s| s.lock().unwrap()).collect();
         // Compare 8-byte prefixes first; only equal prefixes need the full strings.
         let less = |a: u32, b: u32| -> bool {
-            let (ga, gb) = (&guards[(a & 0xFF) as usize], &guards[(b & 0xFF) as usize]);
+            let (ga, gb) = (&shards[(a & 0xFF) as usize], &shards[(b & 0xFF) as usize]);
             let (pa, pb) = (ga.prefs[(a >> 8) as usize], gb.prefs[(b >> 8) as usize]);
             pa < pb || (pa == pb && ga.strs[(a >> 8) as usize] < gb.strs[(b >> 8) as usize])
         };
         let mut best: Vec<u32> = (0..link_space as u32).collect();
-        for (sh, g) in guards.iter().enumerate() {
+        for (sh, g) in shards.iter().enumerate() {
             for local in 0..g.strs.len() {
                 let id = ((local as u32) << 8) | sh as u32;
                 let r = uf_find(&mut parent, id) as usize;
@@ -986,7 +1127,7 @@ fn main() {
                 }
             }
         }
-        for (sh, g) in guards.iter().enumerate() {
+        for (sh, g) in shards.iter().enumerate() {
             for local in 0..g.strs.len() {
                 let id = ((local as u32) << 8) | sh as u32;
                 canon[id as usize] = best[uf_find(&mut parent, id) as usize];
@@ -994,40 +1135,64 @@ fn main() {
         }
     }
     drop(parent);
-    let person_of = |uid: u32| -> u32 { canon.get(uid as usize).copied().unwrap_or(uid) };
-    clock.log(&format!("links: {} pairs", link_pairs.len()));
+    // Read-only lookup table, one region per shard, built in parallel.
+    let max_shard = shards.iter().map(|s| s.strs.len()).max().unwrap_or(0);
+    let rbits = (2 * max_shard.max(8)).next_power_of_two().trailing_zeros();
+    let mut link_table =
+        LinkTable { slots: vec![LinkSlot { h1: 0, canon: u32::MAX, h2: 0 }; NSHARD << rbits], rbits };
+    link_table.slots.par_chunks_mut(1 << rbits).zip(shards.par_iter()).enumerate().for_each(|(sh, (region, shard))| {
+        let mask = (1usize << rbits) - 1;
+        for &(h1, h2, local) in shard.table.iter() {
+            let mut i = ((h1 >> 8) as usize) & mask;
+            while region[i].canon != u32::MAX {
+                i = (i + 1) & mask;
+            }
+            region[i] = LinkSlot { h1, canon: canon[((local << 8) | sh as u32) as usize], h2 };
+        }
+    });
+    let names: Vec<Vec<S>> = shards.into_iter().map(|s| s.strs).collect();
+    clock.log(&format!("links: {} pairs, {} linked ids", link_pairs.len(), names.iter().map(|v| v.len()).sum::<usize>()));
 
-    // --- events: parse (R-E1), validate each copy (R-E3, R-E4) ---------------------
-    let event_parts: Vec<Vec<Shared<Vec<ERec>>>> = load_chunks(&data.join("events"))
-        .into_par_iter()
-        .map(|chunk| {
-            let est = chunk.len() / 64;
-            let mut out: Vec<Vec<ERec>> = buckets(est / NSHARD + est / (4 * NSHARD) + 16);
-            scan_rows::<7>(chunk, |f| {
+    // --- parse events and clicks together, every chunk of every file (R-C1) -------------
+    // Each valid row is written once, straight into its person's partition; each line's
+    // dedup key goes to its event_id / click_id partition.
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Events,
+        Clicks,
+    }
+    let mut work: Vec<(Kind, S)> = Vec::new();
+    work.extend(load_chunks(&data.join("events")).into_iter().map(|c| (Kind::Events, c)));
+    work.extend(load_chunks(&data.join("clicks")).into_iter().map(|c| (Kind::Clicks, c)));
+    let nthreads = rayon::current_num_threads();
+    // One output set per pool thread, plus one for the calling thread (rayon runs tiny jobs inline).
+    let outs: Vec<Shared<ThreadOut>> = (0..nthreads + 1).map(|_| Shared::new(ThreadOut::new())).collect();
+    work.par_iter().for_each(|&(kind, chunk)| {
+        // Safety: a pool thread runs one of these closures at a time and never yields inside it.
+        let out = unsafe { outs[rayon::current_thread_index().unwrap_or(nthreads)].get() };
+        match kind {
+            Kind::Events => scan_rows::<7>(chunk, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
                     return; // R-E1
                 }
-                let hash = hash_bytes(eid);
+                let user = f[1];
+                let uh1 = hash_bytes(user);
+                link_table.prefetch(uh1);
+                let h1 = hash_bytes(eid);
                 let ingest = parse_ts(f[3]); // R-T10
-                let mut r = ERec {
-                    hash,
-                    eid_ptr: eid.as_ptr() as usize,
-                    user_ptr: f[1].as_ptr() as usize,
-                    uh1: 0,
-                    ingest: ingest.unwrap_or(i64::MAX),
-                    eid_len: eid.len() as u32,
-                    user_len: f[1].len() as u32,
-                    uh2: 0,
-                    ts_rel: 0,
-                    price: 0,
-                    cat: 0,
-                    typ: 0,
-                    valid: false,
+                let mut key = EKey {
+                    h1,
+                    row: 0,
+                    h2: hash_bytes2(eid),
+                    ingest: match ingest {
+                        Some(t) => (t - ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32,
+                        None => i32::MAX,
+                    },
                 };
                 'validate: {
                     let Some(ingest) = ingest else { break 'validate };
-                    if f[1].is_empty() || f[5].is_empty() {
+                    if user.is_empty() || f[5].is_empty() {
                         break 'validate; // R-E3: user_id and product_id non-empty
                     }
                     let Some(ts) = parse_ts(f[2]) else { break 'validate };
@@ -1052,221 +1217,112 @@ fn main() {
                         0 // price ignored for view/cart
                     };
                     let ph = hash_bytes(f[5]);
-                    r.cat = products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2); // R-E7
-                    r.ts_rel = (ts - base) as u32;
-                    r.typ = typ;
-                    r.price = price;
-                    r.uh1 = hash_bytes(f[1]);
-                    r.uh2 = hash_bytes2(f[1]);
-                    r.valid = true;
+                    let cat = products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2); // R-E7
+                    let uh2 = hash_bytes2(user);
+                    let ts_rel = (ts - base) as u64;
+                    // R-L4/R-L6: a linked ID belongs to its person, any other ID is its own person.
+                    let (pkey, k2, name, shard) = match link_table.get(uh1, uh2) {
+                        Some(c) => (LINKED | c as u64, ts_rel, 0, (c & 0xFF) as usize),
+                        None => (uh1 & !LINKED, ((uh2 as u64) << 32) | ts_rel, pack_ref(user), shard_of(uh1)),
+                    };
+                    key.row = out.ev_rows[shard].push(Row { pkey, k2, name, price, cat, typ, dead: 0 }) as usize;
                 }
-                out[shard_of(hash)].push(r);
-            });
-            out.into_iter().map(Shared::new).collect()
-        })
-        .collect();
-    clock.log("events parsed");
-
-    // --- R-E2: dedup on event_id BEFORE validation, keep the smallest ingest_ts.
-    // One task per event_id shard. Losing copies are marked invalid in place, then the
-    // survivors leave in file order, bucketed by the shard of their user ID.
-    let ev_by_user: Vec<Vec<Vec<SEv>>> = (0..NSHARD)
-        .into_par_iter()
-        .map(|s| {
-            // Safety: bucket s of every part is only touched by this task.
-            let parts: Vec<&mut Vec<ERec>> = event_parts.iter().map(|p| unsafe { p[s].get() }).collect();
-            let n: usize = parts.iter().map(|p| p.len()).sum();
-            let mut table: HashTable<*mut ERec> = HashTable::with_capacity(n);
-            let mut out: Vec<Vec<SEv>> = buckets(n / NSHARD + n / (4 * NSHARD) + 8);
-            for part in parts {
-                for r in part.iter_mut() {
-                    let rp: *mut ERec = r;
-                    unsafe {
-                        let (h, ptr, len) = ((*rp).hash, (*rp).eid_ptr, (*rp).eid_len);
-                        match table.entry(
-                            h,
-                            |&e| (*e).hash == h && (*e).eid_len == len && bytes_at((*e).eid_ptr, len) == bytes_at(ptr, len),
-                            |&e| (*e).hash,
-                        ) {
-                            Entry::Occupied(mut o) => {
-                                let cur = *o.get();
-                                if (*rp).ingest < (*cur).ingest {
-                                    (*cur).valid = false;
-                                    *o.get_mut() = rp;
-                                } else {
-                                    (*rp).valid = false;
-                                }
-                            }
-                            Entry::Vacant(v) => {
-                                v.insert(rp);
-                            }
-                        }
-                    }
+                out.ev_keys[shard_of(h1)].push(key);
+            }),
+            Kind::Clicks => scan_rows::<4>(chunk, |&[cid, user, camp, ts]| {
+                // R-K1..R-K3. Copies of a click are identical, so an invalid line can never
+                // be the kept copy of a valid click: only valid lines need a dedup key.
+                if cid.is_empty() || user.is_empty() {
+                    return;
                 }
-            }
-            drop(table);
-            for part in event_parts.iter() {
-                for r in unsafe { p_get(&part[s]) } {
-                    if r.valid {
-                        out[shard_of(r.uh1)].push(SEv {
-                            uh1: r.uh1,
-                            user_ptr: r.user_ptr,
-                            user_len: r.user_len,
-                            uh2: r.uh2,
-                            ts_rel: r.ts_rel,
-                            price: r.price,
-                            cat: r.cat,
-                            typ: r.typ,
-                        });
-                    }
+                let uh1 = hash_bytes(user);
+                link_table.prefetch(uh1);
+                let Some(t) = parse_ts(ts) else { return };
+                if t < base || t >= we {
+                    return; // R-T8
                 }
-            }
-            out
-        })
-        .collect();
-    clock.log("events deduped");
-
-    // --- clicks: parse (R-K1), validate (R-K3), dedup (R-K2) -------------------------
-    let click_parts: Vec<Vec<Shared<Vec<CRec>>>> = load_chunks(&data.join("clicks"))
-        .into_par_iter()
-        .map(|chunk| {
-            let est = chunk.len() / 40;
-            let mut out: Vec<Vec<CRec>> = buckets(est / NSHARD + est / (4 * NSHARD) + 16);
-            scan_rows::<4>(chunk, |&[cid, user, camp, ts]| {
-                if cid.is_empty() {
-                    return; // R-K1
-                }
-                let hash = hash_bytes(cid);
-                let mut r = CRec {
-                    hash,
-                    cid_ptr: cid.as_ptr() as usize,
-                    user_ptr: user.as_ptr() as usize,
-                    uh1: 0,
-                    cid_len: cid.len() as u32,
-                    user_len: user.len() as u32,
-                    uh2: 0,
-                    ts_rel: 0,
-                    camp: 0,
-                    valid: false,
+                let ch = hash_bytes(camp);
+                let Some(e) = campaigns.find(ch, |e| e.0 == ch && e.1 == camp) else { return }; // R-K3: exact match
+                let uh2 = hash_bytes2(user);
+                let ts_rel = (t - base) as u64;
+                let (pkey, k2, shard) = match link_table.get(uh1, uh2) {
+                    Some(c) => (LINKED | c as u64, ts_rel, (c & 0xFF) as usize),
+                    None => (uh1 & !LINKED, ((uh2 as u64) << 32) | ts_rel, shard_of(uh1)),
                 };
-                'validate: {
-                    if user.is_empty() {
-                        break 'validate;
-                    }
-                    let Some(t) = parse_ts(ts) else { break 'validate };
-                    if t < base || t >= we {
-                        break 'validate; // R-T8
-                    }
-                    let ch = hash_bytes(camp);
-                    let Some(e) = campaigns.find(ch, |e| e.0 == ch && e.1 == camp) else { break 'validate }; // R-K3
-                    r.ts_rel = (t - base) as u32;
-                    r.camp = e.2;
-                    r.uh1 = hash_bytes(user);
-                    r.uh2 = hash_bytes2(user);
-                    r.valid = true;
-                }
-                out[shard_of(hash)].push(r);
-            });
-            out.into_iter().map(Shared::new).collect()
-        })
-        .collect();
-    let click_by_user: Vec<Vec<Vec<SClick>>> = (0..NSHARD)
-        .into_par_iter()
-        .map(|s| {
-            let parts: Vec<&mut Vec<CRec>> = click_parts.iter().map(|p| unsafe { p[s].get() }).collect();
-            let n: usize = parts.iter().map(|p| p.len()).sum();
-            let mut table: HashTable<*const CRec> = HashTable::with_capacity(n);
-            let mut out: Vec<Vec<SClick>> = buckets(n / NSHARD + n / (4 * NSHARD) + 8);
-            for part in parts {
-                for r in part.iter() {
-                    let rp: *const CRec = r;
-                    unsafe {
-                        let (h, ptr, len) = (r.hash, r.cid_ptr, r.cid_len);
-                        // R-K2: copies are identical, keep the first one seen.
-                        let first = match table.entry(
-                            h,
-                            |&e| (*e).hash == h && (*e).cid_len == len && bytes_at((*e).cid_ptr, len) == bytes_at(ptr, len),
-                            |&e| (*e).hash,
-                        ) {
-                            Entry::Occupied(_) => false,
-                            Entry::Vacant(v) => {
-                                v.insert(rp);
-                                true
+                let row = out.cl_rows[shard].push(CRow { pkey, k2, cid: pack_ref(cid), camp: e.2, dead: 0 }) as usize;
+                let h1 = hash_bytes(cid);
+                out.cl_keys[shard_of(h1)].push(CKey { h1, row, h2: hash_bytes2(cid) });
+            }),
+        }
+    });
+    let outs: Vec<ThreadOut> = outs.into_iter().map(|s| s.0.into_inner()).collect();
+    clock.log("events and clicks parsed");
+
+    // --- dedup, one event_id / click_id shard per task. Losing rows are flagged dead.
+    (0..NSHARD).into_par_iter().for_each(|s| {
+        // R-E2: dedup on event_id BEFORE validation: the copy with the smallest ingest_ts is
+        // kept, valid or not; every other copy's row dies.
+        let n: usize = outs.iter().map(|o| o.ev_keys[s].len()).sum();
+        let mut table: HashTable<EKey> = HashTable::with_capacity(n);
+        for o in &outs {
+            for block in &o.ev_keys[s].blocks {
+                for k in block {
+                    match table.entry(k.h1, |e| e.h1 == k.h1 && e.h2 == k.h2, |e| e.h1) {
+                        Entry::Occupied(mut occ) => {
+                            let cur = occ.get_mut();
+                            let loser = if k.ingest < cur.ingest { std::mem::replace(cur, *k).row } else { k.row };
+                            if loser != 0 {
+                                // Safety: a row is referenced by exactly one key, and its key
+                                // lives in this shard only.
+                                unsafe { core::ptr::addr_of_mut!((*(loser as *mut Row)).dead).write(1) };
                             }
-                        };
-                        if first && r.valid {
-                            out[shard_of(r.uh1)].push(SClick {
-                                uh1: r.uh1,
-                                user_ptr: r.user_ptr,
-                                cid_ptr: r.cid_ptr,
-                                user_len: r.user_len,
-                                cid_len: r.cid_len,
-                                uh2: r.uh2,
-                                ts_rel: r.ts_rel,
-                                camp: r.camp,
-                            });
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(*k);
                         }
                     }
                 }
             }
-            out
-        })
-        .collect();
-    clock.log("clicks parsed and deduped");
-
-    // --- resolve users to persons, one user-ID shard per task (no lock contention, the
-    // shard's table stays in cache). Output is bucketed by person & 0xFF.
-    let by_person: Vec<(Vec<Vec<Ev>>, Vec<Vec<Click>>)> = (0..NSHARD)
-        .into_par_iter()
-        .map(|u| {
-            let mut shard = interner.shards[u].lock().unwrap();
-            let ne: usize = ev_by_user.iter().map(|p| p[u].len()).sum();
-            let nc: usize = click_by_user.iter().map(|p| p[u].len()).sum();
-            let mut evs: Vec<Vec<Ev>> = buckets(ne / NSHARD + ne / (4 * NSHARD) + 8);
-            let mut cls: Vec<Vec<Click>> = buckets(nc / NSHARD + nc / (4 * NSHARD) + 4);
-            for part in &ev_by_user {
-                for r in &part[u] {
-                    let person = person_of(shard.intern(r.uh1, r.uh2, r.user_ptr, r.user_len, u)); // R-L4/R-L6
-                    evs[(person & 0xFF) as usize].push(Ev {
-                        key: ((person as u64) << 32) | r.ts_rel as u64,
-                        price: r.price,
-                        cat: r.cat,
-                        typ: r.typ,
-                    });
+        }
+        drop(table);
+        // R-K2: keep the first copy of a click, flag the rest.
+        let n: usize = outs.iter().map(|o| o.cl_keys[s].len()).sum();
+        let mut table: HashTable<(u64, u32)> = HashTable::with_capacity(n);
+        for o in &outs {
+            for block in &o.cl_keys[s].blocks {
+                for k in block {
+                    match table.entry(k.h1, |e| e.0 == k.h1 && e.1 == k.h2, |e| e.0) {
+                        Entry::Occupied(_) => unsafe {
+                            core::ptr::addr_of_mut!((*(k.row as *mut CRow)).dead).write(1)
+                        },
+                        Entry::Vacant(v) => {
+                            v.insert((k.h1, k.h2));
+                        }
+                    }
                 }
             }
-            for part in &click_by_user {
-                for r in &part[u] {
-                    let person = person_of(shard.intern(r.uh1, r.uh2, r.user_ptr, r.user_len, u));
-                    cls[(person & 0xFF) as usize].push(Click {
-                        key: ((person as u64) << 32) | r.ts_rel as u64,
-                        cid_ptr: r.cid_ptr,
-                        cid_len: r.cid_len,
-                        camp: r.camp,
-                    });
-                }
-            }
-            (evs, cls)
-        })
-        .collect();
-    let names: Vec<Vec<S>> =
-        interner.shards.iter().map(|s| std::mem::take(&mut s.lock().unwrap().strs)).collect();
-    clock.log("users resolved to persons");
+        }
+    });
+    clock.log("deduped");
 
-    // --- sessions, credit, assists: one person partition per task ---------------------
+    // --- sessions, credit, assists: a fixed number of tasks, each with one accumulator
+    // and a spread of person partitions.
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
     let dims = Dims { ndays, day0, base, organic, cat_names: &cat_names, names: &names };
-    // A fixed number of tasks, each with one accumulator and a spread of partitions.
-    let ntask = (rayon::current_num_threads() * 2).clamp(1, NSHARD);
+    let ntask = (nthreads * 2).clamp(1, NSHARD);
     let accs: Vec<Acc> = (0..ntask)
         .into_par_iter()
         .map(|t| {
             let mut acc = Acc::new(ncamp, ndays, ncat);
             for p in (t..NSHARD).step_by(ntask) {
-                for (evs, cls) in &by_person {
-                    acc.events.extend_from_slice(&evs[p]);
-                    acc.clicks.extend_from_slice(&cls[p]);
+                for o in &outs {
+                    for block in &o.ev_rows[p].blocks {
+                        acc.events.extend(block.iter().filter(|r| r.dead == 0));
+                    }
+                    for block in &o.cl_rows[p].blocks {
+                        acc.clicks.extend(block.iter().filter(|r| r.dead == 0));
+                    }
                 }
                 acc.process(&dims);
             }
@@ -1277,7 +1333,7 @@ fn main() {
     let n_user_rows: usize = accs.iter().map(|a| a.u_user.len()).sum();
     clock.log(&format!("sessions: {n_sessions}, user_daily rows: {n_user_rows}"));
 
-    // --- outputs (R-O): one user_daily file per worker, written in parallel ------------
+    // --- outputs (R-O): one user_daily file per task, written in parallel --------------
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     fs::create_dir_all(&ud).unwrap_or_else(|e| panic!("mkdir {}: {e}", ud.display()));
@@ -1300,14 +1356,6 @@ fn main() {
             a.u_user.len(),
         );
     });
-    if accs.is_empty() {
-        write_parquet(
-            &ud.join("part-0.parquet"),
-            USER_SCHEMA,
-            &[Col::Str(&[]), Col::Date(&[]), Col::I64(&[]), Col::I64(&[]), Col::I64(&[]), Col::OptStr(&[])],
-            0,
-        );
-    }
 
     let (mut k_id, mut k_channel, mut k_day) = (Vec::new(), Vec::new(), Vec::new());
     let (mut k_sessions, mut k_purchasing, mut k_revenue, mut k_assisted) =
@@ -1345,12 +1393,11 @@ fn main() {
         n_camp_rows,
     );
     clock.log(&format!("written: {n_user_rows} user rows, {n_camp_rows} campaign rows"));
+    if std::env::var_os("PROF").is_some() {
+        eprintln!("PROF {}", proc_stats());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        eprintln!("PROF exit_called_at_ns={}", now.as_nanos());
+    }
     // Everything is flushed and closed; skip destructors and unmapping.
     std::process::exit(0);
-}
-
-/// Shared read of a bucket after its owning task has finished mutating it.
-#[inline(always)]
-unsafe fn p_get<T>(s: &Shared<Vec<T>>) -> &Vec<T> {
-    &*s.0.get()
 }
