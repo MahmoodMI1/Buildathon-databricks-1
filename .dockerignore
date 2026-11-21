@@ -1,0 +1,21 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+
+# Generated data and local environment
+big/
+dev-answer/
+*.parquet
+*.csv.gz
+*.zip
+downloads/
+scratch/
+.venv/
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+__pycache__/
+*.pyc
+.DS_Store

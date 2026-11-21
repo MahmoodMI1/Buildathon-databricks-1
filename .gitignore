@@ -1,0 +1,21 @@
+# Generated data — never commit (repo must stay under 50 MB)
+dev/
+out/
+big/
+dev-answer/
+*.parquet
+*.csv.gz
+*.zip
+downloads/
+scratch/
+
+# Claude Code files (local only)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# Local environment
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
