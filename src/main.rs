@@ -83,7 +83,7 @@ const GAP_MS: i64 = 1_800_000; // R-E5
 const LATE_MS: i64 = DAY_MS; // R-E4
 const WEEK_MS: i64 = 7 * DAY_MS; // R-T8, R-K4
 const NSHARD: usize = 256;
-const CHUNK_BYTES: usize = 8 << 20;
+const CHUNK_BYTES: usize = 1 << 20;
 
 const T_VIEW: u8 = 0;
 const T_CART: u8 = 1;
@@ -115,47 +115,64 @@ impl Clock {
     }
 }
 
-#[inline]
-fn hash_bytes(b: &[u8]) -> u64 {
-    const K: u64 = 0x9FB2_1C65_1E98_DF25;
-    let mut h: u64 = 0x9E37_79B9_7F4A_7C15 ^ (b.len() as u64);
-    let mut chunks = b.chunks_exact(8);
-    for w in &mut chunks {
-        let v = u64::from_le_bytes(w.try_into().unwrap());
-        h = (h ^ v).wrapping_mul(K);
-        h ^= h >> 32;
-    }
-    let r = chunks.remainder();
-    if !r.is_empty() {
-        let mut t = [0u8; 8];
-        t[..r.len()].copy_from_slice(r);
-        h = (h ^ u64::from_le_bytes(t)).wrapping_mul(K);
-        h ^= h >> 32;
-    }
-    h = (h ^ (h >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^ (h >> 32)
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128) * (b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
 }
 
-/// A second hash, independent of `hash_bytes` (different seed, multiplier and finaliser).
-/// (hash_bytes, hash_bytes2) together are a 96-bit fingerprint of an ID.
-#[inline]
-fn hash_bytes2(b: &[u8]) -> u32 {
-    const K: u64 = 0xD6E8_FEB8_6659_FD93;
-    let mut h: u64 = 0xA076_1D64_78BD_642F ^ ((b.len() as u64) << 32);
-    let mut chunks = b.chunks_exact(8);
-    for w in &mut chunks {
-        let v = u64::from_le_bytes(w.try_into().unwrap());
-        h = (h.rotate_left(23) ^ v).wrapping_mul(K);
+/// 96-bit fingerprint (h1, h2) of an ID in one pass (wyhash-style folded multiplies).
+/// For IDs up to 16 bytes, (a, c) below is an exact encoding of the bytes, and h1 and h2
+/// are two different mixes of it; longer IDs run two independent lanes.
+#[inline(always)]
+fn fingerprint(b: &[u8]) -> (u64, u32) {
+    const S0: u64 = 0xA076_1D64_78BD_642F;
+    const S1: u64 = 0xE703_7ED1_A0B4_28DB;
+    const S2: u64 = 0x8EBC_6AF0_9C88_C6E3;
+    const S3: u64 = 0x5899_65CC_7537_4CC3;
+    let n = b.len();
+    let p = b.as_ptr();
+    unsafe {
+        let r4 = |o: usize| (p.add(o) as *const u32).read_unaligned() as u64;
+        let r8 = |o: usize| (p.add(o) as *const u64).read_unaligned();
+        let (a, c, s1, s2);
+        if n <= 16 {
+            if n >= 4 {
+                let d = (n >> 3) << 2;
+                a = (r4(0) << 32) | r4(d);
+                c = (r4(n - 4) << 32) | r4(n - 4 - d);
+            } else if n > 0 {
+                a = ((*p as u64) << 16) | ((*p.add(n >> 1) as u64) << 8) | (*p.add(n - 1) as u64);
+                c = 0;
+            } else {
+                a = 0;
+                c = 0;
+            }
+            s1 = S0;
+            s2 = S2;
+        } else {
+            let (mut t1, mut t2) = (S0, S2);
+            let mut i = 0;
+            while i + 16 < n {
+                let (x, y) = (r8(i), r8(i + 8));
+                t1 = mum(x ^ S1, y ^ t1);
+                t2 = mum(x ^ S3, y ^ t2);
+                i += 16;
+            }
+            a = r8(n - 16);
+            c = r8(n - 8);
+            s1 = t1;
+            s2 = t2;
+        }
+        let h1 = mum(S1 ^ (n as u64), mum(a ^ S1, c ^ s1));
+        let h2 = mum(S3 ^ (n as u64), mum(a ^ S3, c ^ s2));
+        (h1, (h2 >> 32) as u32)
     }
-    let r = chunks.remainder();
-    if !r.is_empty() {
-        let mut t = [0u8; 8];
-        t[..r.len()].copy_from_slice(r);
-        h = (h.rotate_left(23) ^ u64::from_le_bytes(t)).wrapping_mul(K);
-    }
-    h ^= h >> 31;
-    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-    (h >> 32) as u32
+}
+
+#[inline(always)]
+fn hash_bytes(b: &[u8]) -> u64 {
+    fingerprint(b).0
 }
 
 /// Shard from the middle bits: hashbrown uses the low bits for the bucket and the
@@ -322,6 +339,102 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     Some(v)
 }
 
+/// (year, month, day) for days since 1970-01-01 (Hinnant's civil_from_days).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// Fast paths for the common timestamp shapes; anything else goes to `parse_ts`, so the
+/// result is always exactly what `parse_ts` returns.
+struct TsFast {
+    /// The months around the window: ("YYYY-MM-" as a little-endian u64, days since the
+    /// epoch of day 0 of that month, days in the month).
+    months: Vec<(u64, i64, i64)>,
+}
+
+impl TsFast {
+    fn new(ws: i64, we: i64) -> Self {
+        let mut months: Vec<(u64, i64, i64)> = Vec::new();
+        let (d0, d1) = ((ws - 9 * DAY_MS).div_euclid(DAY_MS), (we + 9 * DAY_MS).div_euclid(DAY_MS));
+        for day in d0..=d1 {
+            let (y, m, _) = civil_from_days(day);
+            if !(0..=9999).contains(&y) {
+                continue;
+            }
+            let text = format!("{y:04}-{m:02}-");
+            let key = u64::from_le_bytes(text.as_bytes().try_into().unwrap());
+            if months.iter().all(|e| e.0 != key) {
+                let first = days_from_civil(y, m, 1);
+                let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+                months.push((key, first - 1, days_from_civil(ny, nm, 1) - first));
+            }
+        }
+        TsFast { months }
+    }
+
+    #[inline(always)]
+    fn parse(&self, b: &[u8]) -> Option<i64> {
+        const ZEROS: u64 = 0x3030_3030_3030_3030;
+        let n = b.len();
+        let p = b.as_ptr();
+        unsafe {
+            if n == 20 {
+                // F1: YYYY-MM-DDTHH:MM:SSZ with the month taken from the table.
+                let pre = (p as *const u64).read_unaligned();
+                for &(key, day0, dim) in &self.months {
+                    if key == pre {
+                        let (d0, d1) = ((*p.add(8)).wrapping_sub(b'0'), (*p.add(9)).wrapping_sub(b'0'));
+                        let v = (p.add(11) as *const u64).read_unaligned() ^ 0x3030_3A30_303A_3030; // HH:MM:SS
+                        if d0 > 9
+                            || d1 > 9
+                            || *p.add(10) != b'T'
+                            || *p.add(19) != b'Z'
+                            || v & 0xF0F0_FFF0_F0FF_F0F0 != 0
+                            || (v + 0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0 != 0
+                        {
+                            break;
+                        }
+                        let dd = (d0 * 10 + d1) as i64;
+                        let h = ((v & 0xFF) * 10 + ((v >> 8) & 0xFF)) as i64;
+                        let mi = (((v >> 24) & 0xFF) * 10 + ((v >> 32) & 0xFF)) as i64;
+                        let sec = (((v >> 48) & 0xFF) * 10 + (v >> 56)) as i64;
+                        if dd < 1 || dd > dim || h > 23 || mi > 59 || sec > 59 {
+                            return None; // R-T5
+                        }
+                        return Some(((day0 + dd) * 86_400 + h * 3600 + mi * 60 + sec) * 1000);
+                    }
+                }
+            } else if n == 13 {
+                // F3 with 13 digits: 8 digits at once, then 5.
+                let v = (p as *const u64).read_unaligned() ^ ZEROS;
+                if v & 0xF0F0_F0F0_F0F0_F0F0 == 0 && (v + 0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0 == 0 {
+                    let v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+                    let v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+                    let mut x = ((v * 10_000 + (v >> 32)) & 0xFFFF_FFFF) as i64;
+                    let mut ok = true;
+                    for k in 8..13 {
+                        let d = (*p.add(k)).wrapping_sub(b'0');
+                        ok &= d <= 9;
+                        x = x * 10 + d as i64;
+                    }
+                    if ok {
+                        return Some(x);
+                    }
+                }
+            }
+        }
+        parse_ts(b)
+    }
+}
+
 /// R-E3: digits only, value 1..=10,000,000; leading zeros allowed.
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
@@ -361,40 +474,133 @@ fn manifest_value(text: &str, key: &str) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// SIMD scanner: one pass over a chunk finds every comma, newline and quote.
+// Scanner. Stage 1 turns a chunk into a structural index with 64-byte SIMD masks:
+// the positions of every `,` and `\n`, and a bitmap of every `"`. Stage 2 cuts
+// lines out of the index.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 mod simd {
     use core::arch::x86_64::*;
-    /// log2 of the number of mask bits per input byte.
-    pub const SHIFT: u32 = 0;
-    /// Bit i is set when byte i of the 16 bytes at `p` is `,`, `\n` or `"`.
+    /// (bit i set when byte i is `,` or `\n`, bit i set when byte i is `"`) for 64 bytes at `p`.
     #[inline(always)]
-    pub unsafe fn mask16(p: *const u8) -> u64 {
-        let v = _mm_loadu_si128(p as *const __m128i);
-        let m = _mm_or_si128(
-            _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8)), _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8))),
-            _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8)),
-        );
-        _mm_movemask_epi8(m) as u32 as u64
+    pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
+        let (comma, nl, quote) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
+        let (mut st, mut qu) = (0u64, 0u64);
+        for k in 0..4 {
+            let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
+            let s = _mm_or_si128(_mm_cmpeq_epi8(v, comma), _mm_cmpeq_epi8(v, nl));
+            st |= (_mm_movemask_epi8(s) as u32 as u64) << (16 * k);
+            qu |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, quote)) as u32 as u64) << (16 * k);
+        }
+        (st, qu)
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 mod simd {
     use core::arch::aarch64::*;
-    pub const SHIFT: u32 = 2;
-    /// Bit 4*i+3 is set when byte i of the 16 bytes at `p` is `,`, `\n` or `"`.
     #[inline(always)]
-    pub unsafe fn mask16(p: *const u8) -> u64 {
-        let v = vld1q_u8(p);
-        let m = vorrq_u8(
-            vorrq_u8(vceqq_u8(v, vdupq_n_u8(b',')), vceqq_u8(v, vdupq_n_u8(b'\n'))),
-            vceqq_u8(v, vdupq_n_u8(b'"')),
-        );
-        let n = vshrn_n_u16::<4>(vreinterpretq_u16_u8(m));
-        vget_lane_u64::<0>(vreinterpret_u64_u8(n)) & 0x8888_8888_8888_8888
+    unsafe fn bitmask(m: [uint8x16_t; 4]) -> u64 {
+        let bits = vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+        let s0 = vpaddq_u8(vandq_u8(m[0], bits), vandq_u8(m[1], bits));
+        let s1 = vpaddq_u8(vandq_u8(m[2], bits), vandq_u8(m[3], bits));
+        let s = vpaddq_u8(s0, s1);
+        let s = vpaddq_u8(s, s);
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(s))
+    }
+    /// (bit i set when byte i is `,` or `\n`, bit i set when byte i is `"`) for 64 bytes at `p`.
+    #[inline(always)]
+    pub unsafe fn masks64(p: *const u8) -> (u64, u64) {
+        let (comma, nl, quote) = (vdupq_n_u8(b','), vdupq_n_u8(b'\n'), vdupq_n_u8(b'"'));
+        let v = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
+        let st = [
+            vorrq_u8(vceqq_u8(v[0], comma), vceqq_u8(v[0], nl)),
+            vorrq_u8(vceqq_u8(v[1], comma), vceqq_u8(v[1], nl)),
+            vorrq_u8(vceqq_u8(v[2], comma), vceqq_u8(v[2], nl)),
+            vorrq_u8(vceqq_u8(v[3], comma), vceqq_u8(v[3], nl)),
+        ];
+        let qu = [vceqq_u8(v[0], quote), vceqq_u8(v[1], quote), vceqq_u8(v[2], quote), vceqq_u8(v[3], quote)];
+        (bitmask(st), bitmask(qu))
+    }
+}
+
+/// Reusable structural index of one chunk.
+#[derive(Default)]
+struct Scan {
+    pos: Vec<u32>,   // offsets of every `,` and `\n`, in order
+    quote: Vec<u64>, // bit i set when byte i is `"`
+}
+
+impl Scan {
+    fn index(&mut self, chunk: S) {
+        let len = chunk.len();
+        assert!(len < u32::MAX as usize - 128);
+        let base = chunk.as_ptr();
+        self.pos.clear();
+        self.pos.reserve(len + 80); // worst case: every byte is structural
+        self.quote.clear();
+        self.quote.resize(len / 64 + 2, 0);
+        let out = self.pos.as_mut_ptr();
+        let mut n = 0usize;
+        let mut i = 0usize;
+        let emit = |i: usize, st: u64, n: &mut usize| unsafe {
+            // Write 8 slots unconditionally (branch-free for the common case), more if needed.
+            let cnt = st.count_ones() as usize;
+            let mut m = st;
+            let mut w = out.add(*n);
+            for _ in 0..8 {
+                *w = i as u32 + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+                w = w.add(1);
+            }
+            if cnt > 8 {
+                for _ in 8..cnt {
+                    *w = i as u32 + m.trailing_zeros();
+                    m &= m.wrapping_sub(1);
+                    w = w.add(1);
+                }
+            }
+            *n += cnt;
+        };
+        while i + 64 <= len {
+            let (st, qu) = unsafe { simd::masks64(base.add(i)) };
+            self.quote[i >> 6] = qu;
+            emit(i, st, &mut n);
+            i += 64;
+        }
+        if i < len {
+            let mut tail = [0u8; 64]; // zero is not a structural byte
+            tail[..len - i].copy_from_slice(&chunk[i..]);
+            let (st, qu) = unsafe { simd::masks64(tail.as_ptr()) };
+            self.quote[i >> 6] = qu;
+            emit(i, st, &mut n);
+        }
+        if len > 0 && chunk[len - 1] != b'\n' {
+            unsafe { *out.add(n) = len as u32 }; // a last line without `\n` is a line (Q1)
+            n += 1;
+        }
+        unsafe { self.pos.set_len(n) };
+    }
+
+    /// Number of quotes in bytes [a, b).
+    #[inline(always)]
+    fn quotes_in(&self, a: usize, b: usize) -> u32 {
+        let (wa, wb) = (a >> 6, b >> 6);
+        let q = &self.quote;
+        unsafe {
+            if wa == wb {
+                return ((*q.get_unchecked(wa) >> (a & 63)) & ((1u64 << (b - a)) - 1)).count_ones();
+            }
+            let mut c = (*q.get_unchecked(wa) >> (a & 63)).count_ones();
+            for w in wa + 1..wb {
+                c += q.get_unchecked(w).count_ones();
+            }
+            if b & 63 != 0 {
+                c += (*q.get_unchecked(wb) & ((1u64 << (b & 63)) - 1)).count_ones();
+            }
+            c
+        }
     }
 }
 
@@ -405,80 +611,76 @@ mod simd {
 /// quote, a wrong field count or an empty line makes the line malformed and it is skipped.
 /// An empty slice is a null field (R-C6).
 #[inline(always)]
-fn scan_rows<const N: usize>(chunk: S, mut on_row: impl FnMut(&[S; N])) {
+fn scan_rows<const N: usize>(chunk: S, sc: &mut Scan, mut on_row: impl FnMut(&[S; N])) {
+    sc.index(chunk);
     let len = chunk.len();
     let base = chunk.as_ptr();
+    let pos = &sc.pos[..];
+    let np = pos.len();
+    let byte = |p: u32| -> u8 { unsafe { *base.add(p as usize) } };
+    let is_nl = |p: u32| -> bool { p as usize == len || byte(p) == b'\n' };
     let mut fields: [S; N] = [&[]; N];
-    let mut nf = 0usize; // fields closed so far in this line
-    let mut bad = false;
-    let mut fstart = 0usize; // start of the current field
-    let mut nq = 0u32; // quotes seen in the current field
-    let mut q_first = false; // the first quote was the field's first byte
-    let mut last_q = 0usize;
-
-    macro_rules! special {
-        ($pos:expr, $c:expr) => {{
-            let pos: usize = $pos;
-            let c: u8 = $c;
-            if c == b'"' {
-                if nq == 0 {
-                    q_first = pos == fstart;
-                }
-                nq += 1;
-                last_q = pos;
-            } else {
-                // `,` or `\n`: the current field ends at pos.
-                let (s, e) = if nq == 0 {
-                    (fstart, pos)
-                } else if nq == 2 && q_first && last_q + 1 == pos {
-                    (fstart + 1, pos - 1)
-                } else {
-                    bad = true;
-                    (fstart, pos)
-                };
-                if nf < N {
-                    fields[nf] = unsafe { core::slice::from_raw_parts(base.add(s), e - s) };
-                }
-                nf += 1;
-                fstart = pos + 1;
-                nq = 0;
-                if c == b'\n' {
-                    if nf == N && !bad {
-                        on_row(&fields);
+    let mut i = 0usize; // index into pos of the first structural byte of the current line
+    let mut line_start = 0usize;
+    while i < np {
+        // Well-formed shape: N-1 commas, then the newline.
+        let mut ok = i + N <= np;
+        if ok {
+            for k in 0..N - 1 {
+                ok &= (pos[i + k] as usize) < len && byte(pos[i + k]) == b',';
+            }
+            ok &= is_nl(pos[i + N - 1]);
+        }
+        if !ok {
+            // Wrong field count (or an empty line): skip to after this line's newline.
+            let mut j = i;
+            while j < np && !is_nl(pos[j]) {
+                j += 1;
+            }
+            if j >= np {
+                break;
+            }
+            line_start = pos[j] as usize + 1;
+            i = j + 1;
+            continue;
+        }
+        let end = pos[i + N - 1] as usize;
+        let mut s = line_start;
+        for k in 0..N {
+            let e = pos[i + k] as usize;
+            fields[k] = unsafe { core::slice::from_raw_parts(base.add(s), e - s) };
+            s = e + 1;
+        }
+        i += N;
+        let total_quotes = sc.quotes_in(line_start, end);
+        line_start = end + 1;
+        if total_quotes != 0 {
+            // Every quote must be the first or last byte of a field that has both.
+            let mut wrapped = 0u32;
+            let mut bad = false;
+            for f in fields.iter_mut() {
+                if !f.is_empty() && f[0] == b'"' {
+                    let l = f.len();
+                    if l < 2 || f[l - 1] != b'"' {
+                        bad = true;
+                        break;
                     }
-                    nf = 0;
-                    bad = false;
+                    *f = &f[1..l - 1];
+                    wrapped += 2;
                 }
             }
-        }};
-    }
-
-    let mut i = 0usize;
-    while i + 16 <= len {
-        let mut m = unsafe { simd::mask16(base.add(i)) };
-        while m != 0 {
-            let pos = i + (m.trailing_zeros() >> simd::SHIFT) as usize;
-            m &= m - 1;
-            special!(pos, unsafe { *base.add(pos) });
+            if bad || wrapped != total_quotes {
+                continue; // R-C7
+            }
         }
-        i += 16;
-    }
-    while i < len {
-        let c = chunk[i];
-        if c == b',' || c == b'\n' || c == b'"' {
-            special!(i, c);
-        }
-        i += 1;
-    }
-    if fstart < len || nf > 0 {
-        special!(len, b'\n'); // last line without a trailing newline
+        on_row(&fields);
     }
 }
 
 // ---------------------------------------------------------------------------
 // ID interning: user ID -> u32. The id is (index within shard << 8) | shard, where the
 // shard comes from the ID's hash. An ID is identified by a 96-bit fingerprint
-// (hash_bytes, hash_bytes2) so that the hot paths never go back to the file bytes;
+// (see fingerprint) so that the hot paths never go back to the file bytes;
 // with a few million IDs the chance of any two colliding is below 1e-14.
 // Links intern from many threads (one lock per call); events and clicks are resolved
 // one whole shard at a time by a single thread.
@@ -527,9 +729,9 @@ impl Interner {
 
     #[inline]
     fn intern(&self, b: S) -> u32 {
-        let h1 = hash_bytes(b);
+        let (h1, h2) = fingerprint(b);
         let sh = shard_of(h1);
-        self.shards[sh].lock().unwrap().intern(h1, hash_bytes2(b), b.as_ptr() as usize, b.len() as u32, sh)
+        self.shards[sh].lock().unwrap().intern(h1, h2, b.as_ptr() as usize, b.len() as u32, sh)
     }
 
     /// Size of the id space: every id handed out so far is below this.
@@ -640,7 +842,7 @@ impl LinkTable {
 // ---------------------------------------------------------------------------
 // Rows. A person is identified by (pkey, h2):
 //   linked ID   -> pkey = 1 << 63 | id of the naming ID, h2 = 0
-//   other user  -> pkey = hash_bytes(user) with bit 63 cleared, h2 = hash_bytes2(user)
+//   other user  -> (pkey, h2) = fingerprint(user), pkey with bit 63 cleared
 // k2 = h2 << 32 | ts_rel, so sorting by (pkey, k2) groups a person and orders by time.
 // Timestamps are relative to `base` = window_start - 7 days (the earliest valid click).
 // ---------------------------------------------------------------------------
@@ -721,6 +923,7 @@ impl<T> BlockBuf<T> {
 
 /// Everything one parser thread produces, bucketed by shard.
 struct ThreadOut {
+    scan: Scan,
     ev_keys: Vec<BlockBuf<EKey>>, // by event_id shard
     ev_rows: Vec<BlockBuf<Row>>,  // by person shard
     cl_keys: Vec<BlockBuf<CKey>>, // by click_id shard
@@ -730,6 +933,7 @@ struct ThreadOut {
 impl ThreadOut {
     fn new() -> Self {
         ThreadOut {
+            scan: Scan::default(),
             ev_keys: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
             ev_rows: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
             cl_keys: (0..NSHARD).map(|_| BlockBuf::new()).collect(),
@@ -1036,13 +1240,15 @@ fn main() {
     let we = manifest_value(&manifest, "window_end");
     let base = ws - WEEK_MS; // earliest valid click (R-T8); all stored timestamps are relative to it
     assert!(we > base && we - base <= u32::MAX as i64, "window too long for 32-bit relative timestamps");
+    let tsf = TsFast::new(ws, we);
 
     // --- products.csv: product_id -> category index (R-E7) ----------------------
     let mut cat_names: Vec<S> = Vec::new();
     let mut cat_index: HashMap<S, u16> = HashMap::new();
     let mut products: HashTable<(u64, S, u16)> = HashTable::new();
+    let mut scan0 = Scan::default();
     for chunk in load_chunks(&data.join("products.csv")) {
-        scan_rows::<2>(chunk, |&[pid, cat]| {
+        scan_rows::<2>(chunk, &mut scan0, |&[pid, cat]| {
             if pid.is_empty() {
                 return;
             }
@@ -1065,7 +1271,7 @@ fn main() {
     let mut camp_channels: Vec<S> = Vec::new();
     let mut campaigns: HashTable<(u64, S, u16)> = HashTable::new();
     for chunk in load_chunks(&data.join("campaigns.csv")) {
-        scan_rows::<2>(chunk, |&[cid, channel]| {
+        scan_rows::<2>(chunk, &mut scan0, |&[cid, channel]| {
             if cid.is_empty() {
                 return;
             }
@@ -1088,7 +1294,8 @@ fn main() {
         .into_par_iter()
         .flat_map_iter(|chunk| {
             let mut v = Vec::with_capacity(chunk.len() / 16);
-            scan_rows::<2>(chunk, |&[a, b]| {
+            let mut sc = Scan::default();
+            scan_rows::<2>(chunk, &mut sc, |&[a, b]| {
                 if !a.is_empty() && !b.is_empty() {
                     v.push((interner.intern(a), interner.intern(b))); // R-L1
                 }
@@ -1170,21 +1377,22 @@ fn main() {
     work.par_iter().for_each(|&(kind, chunk)| {
         // Safety: a pool thread runs one of these closures at a time and never yields inside it.
         let out = unsafe { outs[rayon::current_thread_index().unwrap_or(nthreads)].get() };
+        let mut scan = std::mem::take(&mut out.scan);
         match kind {
-            Kind::Events => scan_rows::<7>(chunk, |f| {
+            Kind::Events => scan_rows::<7>(chunk, &mut scan, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
                     return; // R-E1
                 }
                 let user = f[1];
-                let uh1 = hash_bytes(user);
+                let (uh1, uh2) = fingerprint(user);
                 link_table.prefetch(uh1);
-                let h1 = hash_bytes(eid);
-                let ingest = parse_ts(f[3]); // R-T10
+                let (h1, eh2) = fingerprint(eid);
+                let ingest = tsf.parse(f[3]); // R-T10
                 let mut key = EKey {
                     h1,
                     row: 0,
-                    h2: hash_bytes2(eid),
+                    h2: eh2,
                     ingest: match ingest {
                         Some(t) => (t - ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32,
                         None => i32::MAX,
@@ -1195,7 +1403,7 @@ fn main() {
                     if user.is_empty() || f[5].is_empty() {
                         break 'validate; // R-E3: user_id and product_id non-empty
                     }
-                    let Some(ts) = parse_ts(f[2]) else { break 'validate };
+                    let Some(ts) = tsf.parse(f[2]) else { break 'validate };
                     if ts < ws || ts >= we {
                         break 'validate; // R-T7
                     }
@@ -1218,7 +1426,6 @@ fn main() {
                     };
                     let ph = hash_bytes(f[5]);
                     let cat = products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2); // R-E7
-                    let uh2 = hash_bytes2(user);
                     let ts_rel = (ts - base) as u64;
                     // R-L4/R-L6: a linked ID belongs to its person, any other ID is its own person.
                     let (pkey, k2, name, shard) = match link_table.get(uh1, uh2) {
@@ -1229,31 +1436,31 @@ fn main() {
                 }
                 out.ev_keys[shard_of(h1)].push(key);
             }),
-            Kind::Clicks => scan_rows::<4>(chunk, |&[cid, user, camp, ts]| {
+            Kind::Clicks => scan_rows::<4>(chunk, &mut scan, |&[cid, user, camp, ts]| {
                 // R-K1..R-K3. Copies of a click are identical, so an invalid line can never
                 // be the kept copy of a valid click: only valid lines need a dedup key.
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
-                let uh1 = hash_bytes(user);
+                let (uh1, uh2) = fingerprint(user);
                 link_table.prefetch(uh1);
-                let Some(t) = parse_ts(ts) else { return };
+                let Some(t) = tsf.parse(ts) else { return };
                 if t < base || t >= we {
                     return; // R-T8
                 }
                 let ch = hash_bytes(camp);
                 let Some(e) = campaigns.find(ch, |e| e.0 == ch && e.1 == camp) else { return }; // R-K3: exact match
-                let uh2 = hash_bytes2(user);
                 let ts_rel = (t - base) as u64;
                 let (pkey, k2, shard) = match link_table.get(uh1, uh2) {
                     Some(c) => (LINKED | c as u64, ts_rel, (c & 0xFF) as usize),
                     None => (uh1 & !LINKED, ((uh2 as u64) << 32) | ts_rel, shard_of(uh1)),
                 };
                 let row = out.cl_rows[shard].push(CRow { pkey, k2, cid: pack_ref(cid), camp: e.2, dead: 0 }) as usize;
-                let h1 = hash_bytes(cid);
-                out.cl_keys[shard_of(h1)].push(CKey { h1, row, h2: hash_bytes2(cid) });
+                let (h1, ch2) = fingerprint(cid);
+                out.cl_keys[shard_of(h1)].push(CKey { h1, row, h2: ch2 });
             }),
         }
+        out.scan = scan;
     });
     let outs: Vec<ThreadOut> = outs.into_iter().map(|s| s.0.into_inner()).collect();
     clock.log("events and clicks parsed");
