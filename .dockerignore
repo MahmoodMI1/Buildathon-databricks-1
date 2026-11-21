@@ -1,6 +1,7 @@
 fixtures/
 dev/
 out/
+out*/
 *.md
 .git
 
@@ -13,6 +14,7 @@ dev-answer/
 *.zip
 downloads/
 scratch/
+scratch*/
 .venv/
 CLAUDE.md
 CLAUDE.local.md

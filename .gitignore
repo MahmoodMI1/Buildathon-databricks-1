@@ -1,6 +1,7 @@
 # Generated data — never commit (repo must stay under 50 MB)
 dev/
 out/
+out*/
 big/
 big*/
 dev-answer/
@@ -9,6 +10,7 @@ dev-answer/
 *.zip
 downloads/
 scratch/
+scratch*/
 
 # Claude Code files (local only)
 CLAUDE.md

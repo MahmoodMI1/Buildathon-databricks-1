@@ -11,6 +11,7 @@ temp files under $SCRATCH_DIR. Logs go to stderr only.
 """
 import json
 import os
+import resource
 import sys
 import time
 from datetime import datetime, timezone
@@ -21,10 +22,19 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 T0 = time.time()
+_T_LAST = [T0]
+
+
+def peak_rss_gb():
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return r / (1 << 30) if sys.platform == "darwin" else r / (1 << 20)  # bytes on macOS, KiB on Linux
 
 
 def log(msg):
-    print(f"[{time.time() - T0:7.2f}s] {msg}", file=sys.stderr, flush=True)
+    now = time.time()
+    print(f"[{now - T0:7.2f}s +{now - _T_LAST[0]:6.2f}s rss_peak={peak_rss_gb():5.2f}GB] {msg}",
+          file=sys.stderr, flush=True)
+    _T_LAST[0] = now
 
 
 DATA = os.environ.get("DATA_DIR", "/data")
@@ -139,6 +149,7 @@ def load_lines(subdir, nfields, name):
         WHERE len(p) = {nfields}                                                                -- R-C4/R-C7: exact field count
           AND list_bool_and(list_transform(p, x -> field_ok(x)))                                -- R-C7: quotes only around a whole field
     """)
+    log(f"read {subdir}: {len(files)} files, {count(name)} well-formed lines")
 
 
 # ---------------------------------------------------------------------------
@@ -226,14 +237,23 @@ con.execute(f"""
 """)
 log(f"events: {count('events')} surviving")
 
-# R-E5: sessionize per person. The gap is measured from the previous event in ts order;
-# equal timestamps have gap 0, so ties always share the session of the first of them (E16).
+# R-E5: sessionize per person. The gap is measured between DISTINCT timestamps, so the
+# windows run over distinct (person, ts): the order is then strict and the result cannot
+# depend on how a parallel sort happens to order tied events (E16). Two separate window
+# passes over the raw events could order ties differently and put a tied event into the
+# previous session.
 con.execute(f"""
     CREATE TABLE ev_sess AS
-    SELECT person, price, event_type, category,
-           max(CASE WHEN prev IS NULL OR ts - prev > {GAP_MS} THEN ts END)
-               OVER (PARTITION BY person ORDER BY ts ROWS UNBOUNDED PRECEDING) AS start
-    FROM (SELECT *, lag(ts) OVER (PARTITION BY person ORDER BY ts) AS prev FROM events)
+    WITH d AS (SELECT DISTINCT person, ts FROM events),
+    g AS (SELECT person, ts, lag(ts) OVER (PARTITION BY person ORDER BY ts) AS prev FROM d),
+    s AS (
+        SELECT person, ts,
+               max(CASE WHEN prev IS NULL OR ts - prev > {GAP_MS} THEN ts END)
+                   OVER (PARTITION BY person ORDER BY ts ROWS UNBOUNDED PRECEDING) AS start
+        FROM g
+    )
+    SELECT e.person, e.price, e.event_type, e.category, s.start
+    FROM events e JOIN s ON s.person = e.person AND s.ts = e.ts
 """)
 con.execute("""
     CREATE TABLE sessions AS
