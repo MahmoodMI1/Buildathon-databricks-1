@@ -28,5 +28,7 @@ RUN . /flags.sh && touch src/main.rs \
 
 FROM scratch
 COPY --from=build /shopping-sessions /shopping-sessions
+# DIAGNOSTIC (sub-b9) only: run the pipeline twice so the score splits into compute and fixed cost.
+ENV SS_REPEAT=2
 # Run time: read-only root, uid 1000, no network; /data read-only, /output and /scratch writable.
 CMD ["/shopping-sessions"]
