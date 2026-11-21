@@ -1600,6 +1600,26 @@ fn main() {
     let want = if ncpu > 0 { ncpu } else { std::thread::available_parallelism().map_or(8, |n| n.get()) };
     let _ = rayon::ThreadPoolBuilder::new().num_threads(want.min(15)).build_global();
 
+    // Diagnostic only: SS_REPEAT=N runs the whole pipeline N times in one process, each run
+    // writing the same output. The scorer's time for N=2 minus N=1 is one run's compute; the
+    // rest is fixed cost (container start, exit, VM). Unset (the default) runs once.
+    let repeat: usize = std::env::var("SS_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    for i in 0..repeat {
+        run(&data, &out, &mut clock);
+        if repeat > 1 {
+            clock.log(&format!("run {} of {repeat} done", i + 1));
+        }
+    }
+    if std::env::var_os("PROF").is_some() {
+        eprintln!("PROF {}", proc_stats());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        eprintln!("PROF exit_called_at_ns={}", now.as_nanos());
+    }
+    // Everything is flushed and closed; skip destructors and unmapping.
+    std::process::exit(0);
+}
+
+fn run(data: &Path, out: &Path, clock: &mut Clock) {
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = manifest_value(&manifest, "window_start"); // R-T9
     let we = manifest_value(&manifest, "window_end");
@@ -1982,11 +2002,7 @@ fn main() {
         n_camp_rows,
     );
     clock.log(&format!("written: {n_user_rows} user rows, {n_camp_rows} campaign rows"));
-    if std::env::var_os("PROF").is_some() {
-        eprintln!("PROF {}", proc_stats());
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        eprintln!("PROF exit_called_at_ns={}", now.as_nanos());
-    }
-    // Everything is flushed and closed; skip destructors and unmapping.
-    std::process::exit(0);
+    // Leak the big structures, as process::exit did before run() existed: no run pays for
+    // freeing, so repeated runs time the same work as a single one.
+    std::mem::forget((outs, accs, link_table, link_pairs, canon, names, products, campaigns, work));
 }
