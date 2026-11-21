@@ -119,7 +119,8 @@ fn mum(a: u64, b: u64) -> u64 {
 /// 96-bit fingerprint (h1, h2) of an ID in one pass (wyhash-style folded multiplies).
 /// For IDs up to 16 bytes, (a, c) below is an exact encoding of the bytes, and h1 and h2
 /// are two different mixes of it; longer IDs run two independent lanes.
-#[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn fingerprint(b: &[u8]) -> (u64, u32) {
     const S0: u64 = 0xA076_1D64_78BD_642F;
     const S1: u64 = 0xE703_7ED1_A0B4_28DB;
@@ -375,7 +376,8 @@ impl TsFast {
         TsFast { months }
     }
 
-    #[inline(always)]
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
     fn parse(&self, b: &[u8]) -> Option<i64> {
         const ZEROS: u64 = 0x3030_3030_3030_3030;
         let n = b.len();
@@ -528,6 +530,7 @@ struct Scan {
 }
 
 impl Scan {
+    #[cfg_attr(feature = "prof", inline(never))]
     fn index(&mut self, chunk: S) {
         let len = chunk.len();
         assert!(len < u32::MAX as usize - 128);
@@ -818,7 +821,8 @@ impl LinkTable {
         prefetch(unsafe { self.slots.as_ptr().add(base | i) });
     }
 
-    #[inline(always)]
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
     fn get(&self, h1: u64, h2: u32) -> Option<u32> {
         let (base, mut i, mask) = self.start(h1);
         loop {
@@ -910,7 +914,8 @@ impl<T> BlockBuf<T> {
     fn new() -> Self {
         BlockBuf { blocks: Vec::new() }
     }
-    #[inline(always)]
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
     fn push(&mut self, v: T) -> *mut T {
         if self.blocks.last().map_or(true, |b| b.len() == b.capacity()) {
             self.blocks.push(Vec::with_capacity(Self::BLOCK));
@@ -1246,6 +1251,7 @@ impl Acc {
 
     /// Loads one person partition: every live row of every thread, scattered by bucket
     /// with a counting pass (no comparison sort over the whole partition).
+    #[cfg_attr(feature = "prof", inline(never))]
     fn load(&mut self, outs: &[ThreadOut], p: usize) {
         fn scatter<T: Copy + 'static>(
             blocks: impl Fn() -> Vec<&'static [T]>,
@@ -1327,6 +1333,7 @@ impl Acc {
 
     /// Sessions (R-E5, R-E6), credit (R-K4, R-K5) and assists (R-K7) for the events and
     /// clicks currently in self.events / self.clicks (one partition of persons).
+    #[cfg_attr(feature = "prof", inline(never))]
     fn process(&mut self, d: &Dims) {
         let mut events = std::mem::take(&mut self.events);
         let mut clicks = std::mem::take(&mut self.clicks);
@@ -1577,7 +1584,8 @@ fn main() {
     drop(parent);
     // Read-only lookup table, one region per shard, built in parallel.
     let max_shard = shards.iter().map(|s| s.strs.len()).max().unwrap_or(0);
-    let rbits = (2 * max_shard.max(8)).next_power_of_two().trailing_zeros();
+    // Region load factor between 1/3 and 2/3: dense enough to stay cache-friendly.
+    let rbits = (max_shard + max_shard / 2).max(16).next_power_of_two().trailing_zeros();
     let mut link_table =
         LinkTable { slots: vec![LinkSlot { h1: 0, canon: u32::MAX, h2: 0 }; NSHARD << rbits], rbits };
     link_table.slots.par_chunks_mut(1 << rbits).zip(shards.par_iter()).enumerate().for_each(|(sh, (region, shard))| {
@@ -1657,8 +1665,14 @@ fn main() {
                     } else {
                         0 // price ignored for view/cart
                     };
-                    let ph = hash_bytes(f[5]);
-                    let cat = products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2); // R-E7
+                    // R-E7: the category only matters for purchases (R-O2), so views and carts
+                    // skip the product lookup; product_id only has to be non-empty (R-E3).
+                    let cat = if typ == T_PURCHASE {
+                        let ph = hash_bytes(f[5]);
+                        products.find(ph, |e| e.0 == ph && e.1 == f[5]).map_or(cat_unknown, |e| e.2)
+                    } else {
+                        0
+                    };
                     let ts_rel = (ts - base) as u64;
                     // R-L4/R-L6: a linked ID belongs to its person, any other ID is its own person.
                     let (pkey, k2, name, shard) = match link_table.get(uh1, uh2) {
